@@ -7,8 +7,9 @@ import json
 import base64
 import uuid
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
+from flask.json.provider import DefaultJSONProvider
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, emit
@@ -16,7 +17,14 @@ import pymysql.cursors
 from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import webpush, WebPushException
 
+class CustomJSONProvider(DefaultJSONProvider):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.strftime('%Y-%m-%d %I:%M %p')
+        return super().default(obj)
+
 app = Flask(__name__)
+app.json = CustomJSONProvider(app)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
@@ -24,14 +32,19 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 DB_HOST = '193.203.168.175'
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
-DB_PASS = 'kaisi@0Ahmed' 
+DB_PASS = 'kaisi@0Ahmed'
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
 def get_db_connection():
-    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, cursorclass=pymysql.cursors.DictCursor, autocommit=True)
+    conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, cursorclass=pymysql.cursors.DictCursor, autocommit=True)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SET time_zone = '+03:00'")
+    except: pass
+    return conn
 
 def init_db():
     global VAPID_PRIVATE_KEY, VAPID_PUBLIC_KEY
@@ -118,7 +131,6 @@ def send_web_push(user_id, title, message):
             except: pass
     except: pass
 
-# تم إصلاح جدار الحماية بالكامل هنا لمنع تسجيل الخروج العشوائي
 @app.before_request
 def require_auth():
     if request.method == 'OPTIONS': return
@@ -188,10 +200,16 @@ def handle_location(data):
     with conn.cursor() as cursor:
         cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
         user = cursor.fetchone()
-        if not user or user['role'] != 'employee': return
+        if not user or user['role'] != 'employee': 
+            conn.close() # إغلاق الاتصال إذا كان التوكن غير صالح لمنع تدمير السيرفر
+            return
+            
         lat = data.get('lat'); lng = data.get('lng'); user_id = user['id']
-        now = datetime.utcnow(); recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_str))
+        baghdad_now = datetime.utcnow() + timedelta(hours=3)
+        recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
+        recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
+        
+        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_db))
         
         if user['zone_id']:
             cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
@@ -202,7 +220,7 @@ def handle_location(data):
                     alert_msg = f"⚠️ الموظف {user['name']} خرج من نطاق عمله ({zone['name']})!"
                     socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
 
-        loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_str }
+        loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_display }
     conn.close()
     socketio.emit('new_location', loc_data, room='admins')
     if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
@@ -230,7 +248,7 @@ def create_user():
     if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json()
     hashed_password = generate_password_hash(data.get('password'))
-    emp_id = f"E{int(datetime.now().timestamp())}"
+    emp_id = f"E{int(datetime.utcnow().timestamp())}"
     zone_id = int(data.get('zone_id')) if data.get('zone_id') else None
     team_id = int(data.get('team_id')) if data.get('team_id') else None
     conn = get_db_connection()
@@ -318,7 +336,9 @@ def update_task_status(task_id):
     with conn.cursor() as cursor:
         cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
         task = cursor.fetchone()
-        if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
+        if not task: 
+            conn.close()
+            return jsonify({'error': 'Not found'}), 404
         
         existing_images = []
         if task['image_url']:
@@ -368,7 +388,8 @@ def get_latest_locations():
 def get_location_history(user_id):
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        target_date = request.args.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
+        baghdad_now = datetime.utcnow() + timedelta(hours=3)
+        target_date = request.args.get('date', baghdad_now.strftime('%Y-%m-%d'))
         cursor.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = %s AND DATE(recorded_at) = %s ORDER BY recorded_at ASC', (user_id, target_date))
         history = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'history': history})
