@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch() # يجب أن يكون هذا السطر في البداية تماماً لمنع حظر الشبكة (Timeout)
+
 import os
 import secrets
 import json
@@ -18,7 +21,7 @@ CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # --- إعدادات الاتصال بقاعدة بيانات Hostinger ---
-DB_HOST = 'srv1790.hstgr.io'
+DB_HOST = '193.203.168.175' # استخدام الـ IP المباشر
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
 DB_PASS = 'kaisi@0Ahmed'
