@@ -14,19 +14,15 @@ from flask_socketio import SocketIO, join_room, emit
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
-# تهيئة SocketIO مع السماح بالاتصال من أي مكان
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 DB_NAME = 'field_management.db'
 UPLOAD_FOLDER = os.path.join('static', 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# قاموس لتتبع حركة الموظفين في الذاكرة لغرض "إنذار التوقف الطويل"
-# الصيغة: { user_id: {'lat': lat, 'lng': lng, 'last_moved': datetime_obj, 'alert_sent': boolean} }
 employee_tracking = {}
 
 def get_distance(lat1, lon1, lat2, lon2):
-    """ خوارزمية Haversine لحساب المسافة بين نقطتين بالأمتار """
     R = 6371e3 
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -49,9 +45,7 @@ def init_db():
         cursor = conn.cursor()
         admin_pass = generate_password_hash('admin123')
         cursor.execute('INSERT INTO users (name, phone, email, emp_id, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)', ('مدير النظام', '07000000000', 'admin@domain.com', 'A001', admin_pass, 'admin'))
-        conn.commit()
-        conn.close()
-        print("Database created.")
+        conn.commit(); conn.close()
     
     conn = get_db_connection()
     try: conn.execute("ALTER TABLE tasks ADD COLUMN image_url TEXT")
@@ -61,22 +55,18 @@ def init_db():
     try: conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT DEFAULT 'none'")
     except sqlite3.OperationalError: pass
     conn.execute('CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT, is_read BOOLEAN DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)')
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 @app.before_request
 def require_auth():
     if request.method == 'OPTIONS': return
     if request.endpoint == 'login' or request.endpoint == 'serve_static': return
-    
     token = request.headers.get('Authorization')
     if not token: return jsonify({'error': 'Unauthorized'}), 401
-    
     token = token.replace('Bearer ', '')
     conn = get_db_connection()
     user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
     conn.close()
-    
     if not user: return jsonify({'error': 'Unauthorized'}), 401
     request.current_user = dict(user)
 
@@ -88,11 +78,8 @@ def login():
     if user and check_password_hash(user['password_hash'], data.get('password')):
         token = secrets.token_hex(32)
         conn.execute('UPDATE users SET token = ? WHERE id = ?', (token, user['id']))
-        conn.commit()
-        conn.close()
-        user_data = dict(user)
-        user_data.pop('password_hash') 
-        user_data['token'] = token
+        conn.commit(); conn.close()
+        user_data = dict(user); user_data.pop('password_hash'); user_data['token'] = token
         return jsonify({'success': True, 'user': user_data})
     conn.close()
     return jsonify({'error': 'Unauthorized'}), 401
@@ -100,7 +87,6 @@ def login():
 @app.route('/static/uploads/<path:filename>')
 def serve_static(filename): return send_from_directory(UPLOAD_FOLDER, filename)
 
-# ================= مسارات SocketIO للاتصال اللحظي =================
 @socketio.on('authenticate')
 def handle_auth(data):
     token = data.get('token')
@@ -109,6 +95,8 @@ def handle_auth(data):
     user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
     conn.close()
     if user:
+        # إدخال المستخدم في "غرفة" خاصة به لاستلام إشعاراته الفورية
+        join_room(f"user_{user['id']}")
         if user['role'] == 'admin':
             join_room('admins')
         elif user['role'] == 'manager':
@@ -120,57 +108,33 @@ def handle_location(data):
     conn = get_db_connection()
     user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
     if not user or user['role'] != 'employee':
-        conn.close()
-        return
+        conn.close(); return
 
-    lat = data.get('lat')
-    lng = data.get('lng')
-    user_id = user['id']
-    now = datetime.utcnow()
-    recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    lat = data.get('lat'); lng = data.get('lng'); user_id = user['id']
+    now = datetime.utcnow(); recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-    # حفظ الموقع في قاعدة البيانات
-    conn.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (?, ?, ?, ?, ?)', 
-                 (user_id, lat, lng, False, recorded_at_str))
-    
-    # تجهيز حزمة البيانات للبث
+    conn.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (?, ?, ?, ?, ?)', (user_id, lat, lng, False, recorded_at_str))
     loc_data = { 'user_id': user_id, 'name': user['name'], 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_str }
     
-    # بث الموقع للإدارة لحظياً!
     socketio.emit('new_location', loc_data, room='admins')
-    if user['team_id']:
-        socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
+    if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
 
-    # --- خوارزمية إنذار التوقف الطويل (Idle Alert) ---
     if user_id in employee_tracking:
         prev = employee_tracking[user_id]
         distance = get_distance(prev['lat'], prev['lng'], lat, lng)
-        
-        if distance > 30: # تحرك أكثر من 30 متر (تصفير العداد)
+        if distance > 30: 
             employee_tracking[user_id] = {'lat': lat, 'lng': lng, 'last_moved': now, 'alert_sent': False}
         else:
-            # لم يتحرك كثيراً، نحسب فارق الوقت
             diff_minutes = (now - prev['last_moved']).total_seconds() / 60
             if diff_minutes > 30 and not prev.get('alert_sent'):
                 alert_msg = f"الموظف {user['name']} متوقف في نفس المكان منذ أكثر من 30 دقيقة!"
-                
-                # بث الإنذار اللحظي
                 socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
                 if user['team_id']: socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room=f"manager_{user['team_id']}")
-                
-                # حفظ الإشعار في القاعدة
-                # إذا كان الموظف في فريق، أرسل الإشعار للمشرف أيضاً، وللمدير العام
-                admins = conn.execute("SELECT id FROM users WHERE role = 'admin'").fetchall()
-                for admin in admins:
-                    conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (admin['id'], 'توقف طويل ⚠️', alert_msg))
-                
                 employee_tracking[user_id]['alert_sent'] = True
     else:
         employee_tracking[user_id] = {'lat': lat, 'lng': lng, 'last_moved': now, 'alert_sent': False}
 
-    conn.commit()
-    conn.close()
-# =============================================================
+    conn.commit(); conn.close()
 
 @app.route('/api/teams', methods=['GET', 'POST'])
 def handle_teams():
@@ -179,12 +143,10 @@ def handle_teams():
     if request.method == 'POST':
         data = request.get_json()
         conn.execute('INSERT INTO teams (name, manager_id) VALUES (?, ?)', (data.get('name'), data.get('manager_id')))
-        conn.commit(); conn.close()
-        return jsonify({'success': True})
+        conn.commit(); conn.close(); return jsonify({'success': True})
     else:
         teams = conn.execute('SELECT t.*, u.name as manager_name FROM teams t LEFT JOIN users u ON t.manager_id = u.id').fetchall()
-        conn.close()
-        return jsonify({'success': True, 'teams': [dict(t) for t in teams]})
+        conn.close(); return jsonify({'success': True, 'teams': [dict(t) for t in teams]})
 
 @app.route('/api/users', methods=['POST'])
 def create_user():
@@ -194,7 +156,6 @@ def create_user():
     emp_id = f"E{int(datetime.now().timestamp())}"
     zone_id = int(data.get('zone_id')) if data.get('zone_id') else None
     team_id = int(data.get('team_id')) if data.get('team_id') else None
-
     conn = get_db_connection()
     try:
         conn.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
@@ -202,25 +163,20 @@ def create_user():
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close(); return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مسجل مسبقاً'}), 409
-    conn.close()
-    return jsonify({'success': True})
+    conn.close(); return jsonify({'success': True})
 
 @app.route('/api/users/managers', methods=['GET'])
 def get_managers():
     conn = get_db_connection()
-    managers = conn.execute("SELECT id, name FROM users WHERE role = 'manager'").fetchall()
-    conn.close()
+    managers = conn.execute("SELECT id, name FROM users WHERE role = 'manager'").fetchall(); conn.close()
     return jsonify({'success': True, 'managers': [dict(m) for m in managers]})
 
 @app.route('/api/users/employees', methods=['GET'])
 def get_employees():
     conn = get_db_connection()
-    if request.current_user['role'] == 'admin':
-        users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')").fetchall()
-    else: 
-        users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchall()
-    conn.close()
-    return jsonify({'success': True, 'employees': [dict(u) for u in users]})
+    if request.current_user['role'] == 'admin': users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')").fetchall()
+    else: users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchall()
+    conn.close(); return jsonify({'success': True, 'employees': [dict(u) for u in users]})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -239,12 +195,9 @@ def get_stats():
 @app.route('/api/tasks/all', methods=['GET'])
 def get_all_tasks():
     conn = get_db_connection()
-    if request.current_user['role'] == 'admin':
-        tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id ORDER BY tasks.due_date DESC").fetchall()
-    else:
-        tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id WHERE users.team_id IN (SELECT id FROM teams WHERE manager_id = ?) ORDER BY tasks.due_date DESC", (request.current_user['id'],)).fetchall()
-    conn.close()
-    return jsonify({'success': True, 'tasks': [dict(row) for row in tasks]})
+    if request.current_user['role'] == 'admin': tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id ORDER BY tasks.due_date DESC").fetchall()
+    else: tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id WHERE users.team_id IN (SELECT id FROM teams WHERE manager_id = ?) ORDER BY tasks.due_date DESC", (request.current_user['id'],)).fetchall()
+    conn.close(); return jsonify({'success': True, 'tasks': [dict(row) for row in tasks]})
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
@@ -253,15 +206,23 @@ def create_task():
     conn = get_db_connection()
     conn.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
                  (data['title'], data['assigned_to'], request.current_user['id'], data['lat'], data['lng'], data['due_date'], checklist_json, data.get('recurrence', 'none')))
-    conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (data['assigned_to'], 'مهمة جديدة 🚀', f"تم إسناد مهمة جديدة لك: {data['title']}"))
+    
+    msg_title = 'مهمة جديدة 🚀'
+    msg_body = f"تم إسناد مهمة جديدة لك: {data['title']}"
+    conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (data['assigned_to'], msg_title, msg_body))
     conn.commit(); conn.close()
+    
+    # بث الإشعار اللحظي للموظف المعني فوراً
+    socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{data['assigned_to']}")
+    # تحديث لوحة التحكم للمدراء الآخرين
+    socketio.emit('task_updated', {}, room='admins')
+    
     return jsonify({'success': True})
 
 @app.route('/api/tasks/my', methods=['GET'])
 def get_my_tasks():
     conn = get_db_connection()
-    tasks = conn.execute('SELECT * FROM tasks WHERE assigned_to = ? ORDER BY due_date ASC', (request.current_user['id'],)).fetchall()
-    conn.close()
+    tasks = conn.execute('SELECT * FROM tasks WHERE assigned_to = ? ORDER BY due_date ASC', (request.current_user['id'],)).fetchall(); conn.close()
     return jsonify({'success': True, 'tasks': [dict(row) for row in tasks]})
 
 @app.route('/api/tasks/<int:task_id>/status', methods=['PUT'])
@@ -290,9 +251,16 @@ def update_task_status(task_id):
     
     if data.get('status') == 'completed':
         emp_name = conn.execute('SELECT name FROM users WHERE id = ?', (task['assigned_to'],)).fetchone()['name']
-        conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (task['created_by'], 'إنجاز مهمة ✅', f"أكمل الموظف ({emp_name}) مهمة: {task['title']}"))
+        msg_title = 'إنجاز مهمة ✅'
+        msg_body = f"أكمل الموظف ({emp_name}) مهمة: {task['title']}"
+        conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (task['created_by'], msg_title, msg_body))
+        # إشعار المدير لحظياً
+        socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
 
     conn.commit(); conn.close()
+    
+    # تحديث واجهة الجميع
+    socketio.emit('task_updated', {}, room='admins')
     return jsonify({'success': True})
 
 @app.route('/api/notifications', methods=['GET'])
@@ -308,13 +276,11 @@ def get_notifications():
 
 @app.route('/api/location', methods=['POST'])
 def sync_location_fallback():
-    # هذا المسار سيبقى يعمل فقط كبديل (Fallback) عندما يعمل التطبيق في وضع الأوفلاين
     data = request.get_json()
     conn = get_db_connection()
     conn.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (?, ?, ?, ?, ?)', 
                  (request.current_user['id'], data.get('lat'), data.get('lng'), True, data.get('recorded_at', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))))
-    conn.commit(); conn.close()
-    return jsonify({'success': True})
+    conn.commit(); conn.close(); return jsonify({'success': True})
 
 @app.route('/api/location/latest', methods=['GET'])
 def get_latest_locations():
@@ -322,15 +288,13 @@ def get_latest_locations():
     base_query = "SELECT l.user_id, l.lat, l.lng, l.recorded_at, u.name, u.job_title, u.zone_id FROM location_logs l JOIN users u ON l.user_id = u.id INNER JOIN (SELECT user_id, MAX(recorded_at) as max_date FROM location_logs GROUP BY user_id) grouped_l ON l.user_id = grouped_l.user_id AND l.recorded_at = grouped_l.max_date"
     if request.current_user['role'] == 'admin': locations = conn.execute(base_query).fetchall()
     else: locations = conn.execute(base_query + ' WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)', (request.current_user['id'],)).fetchall()
-    conn.close()
-    return jsonify({'success': True, 'locations': [dict(loc) for loc in locations]})
+    conn.close(); return jsonify({'success': True, 'locations': [dict(loc) for loc in locations]})
 
 @app.route('/api/location/history/<int:user_id>', methods=['GET'])
 def get_location_history(user_id):
     conn = get_db_connection()
     locations = conn.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = ? AND date(recorded_at) = ? ORDER BY recorded_at ASC', (user_id, request.args.get('date'))).fetchall()
-    conn.close()
-    return jsonify({'success': True, 'history': [dict(loc) for loc in locations]})
+    conn.close(); return jsonify({'success': True, 'history': [dict(loc) for loc in locations]})
 
 @app.route('/api/reports', methods=['GET'])
 def get_reports():
@@ -352,14 +316,11 @@ def handle_zones():
     if request.method == 'POST':
         data = request.get_json()
         conn.execute('INSERT INTO zones (name, coordinates_json, color) VALUES (?, ?, ?)', (data.get('name'), data.get('coordinates_json'), data.get('color', '#3b82f6')))
-        conn.commit(); conn.close()
-        return jsonify({'success': True})
+        conn.commit(); conn.close(); return jsonify({'success': True})
     else: 
         zones = conn.execute('SELECT * FROM zones').fetchall()
-        conn.close()
-        return jsonify({'success': True, 'zones': [dict(z) for z in zones]})
+        conn.close(); return jsonify({'success': True, 'zones': [dict(z) for z in zones]})
 
 if __name__ == '__main__':
     init_db()
-    # تشغيل السيرفر عن طريق SocketIO بدلاً من app.run
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
