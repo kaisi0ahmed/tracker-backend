@@ -137,6 +137,7 @@ def require_auth():
     if request.path.startswith('/socket.io'): return
     if request.path.endswith('/login'): return
     if request.path.endswith('/vapid-public-key'): return
+    if request.path.endswith('/location') and request.method == 'POST': return # مستثنى لمعالجة المسار البديل
     
     token = request.headers.get('Authorization')
     if not token: return jsonify({'error': 'Unauthorized'}), 401
@@ -193,24 +194,16 @@ def handle_auth(data):
         if user['role'] == 'admin': join_room('admins')
         elif user['role'] == 'manager': join_room(f"manager_{user['team_id']}")
 
-@socketio.on('send_location')
-def handle_location(data):
-    token = data.get('token')
+# المعالجة الموحدة لتسجيل الإحداثيات
+def process_incoming_location(user, lat, lng):
+    user_id = user['id']
+    baghdad_now = datetime.utcnow() + timedelta(hours=3)
+    recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
+    recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
+    
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-        if not user or user['role'] != 'employee': 
-            conn.close() # إغلاق الاتصال إذا كان التوكن غير صالح لمنع تدمير السيرفر
-            return
-            
-        lat = data.get('lat'); lng = data.get('lng'); user_id = user['id']
-        baghdad_now = datetime.utcnow() + timedelta(hours=3)
-        recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
-        recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
-        
         cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_db))
-        
         if user['zone_id']:
             cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
             zone = cursor.fetchone()
@@ -219,11 +212,42 @@ def handle_location(data):
                 if not is_inside_polygon(lat, lng, coords):
                     alert_msg = f"⚠️ الموظف {user['name']} خرج من نطاق عمله ({zone['name']})!"
                     socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
-
-        loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_display }
     conn.close()
+    
+    loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_display }
     socketio.emit('new_location', loc_data, room='admins')
     if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
+
+# مسار Socket
+@socketio.on('send_location')
+def handle_location(data):
+    token = data.get('token')
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
+    conn.close()
+    if user and user['role'] == 'employee':
+        process_incoming_location(user, data.get('lat'), data.get('lng'))
+
+# المسار البديل والجديد (HTTP Fallback)
+@app.route('/api/location', methods=['POST'])
+def api_fallback_location():
+    data = request.get_json()
+    token = request.headers.get('Authorization')
+    if token: token = token.replace('Bearer ', '')
+    else: token = data.get('token')
+    
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
+    conn.close()
+    
+    if user and user['role'] == 'employee':
+        process_incoming_location(user, data.get('lat'), data.get('lng'))
+        return jsonify({'success': True})
+    return jsonify({'error': 'Unauthorized'}), 401
 
 @app.route('/api/profile/image', methods=['PUT'])
 def update_profile_image():
