@@ -1,8 +1,8 @@
 Flask==3.0.0
-Flask-Cors==4.0.0
 Flask-SocketIO==5.3.6
-Werkzeug==3.0.1
-gunicorn==21.2.0
 eventlet==0.33.3
-pywebpush==1.14.0
+flask-cors==4.0.0
+Werkzeug==3.0.1
 PyMySQL==1.1.0
+pywebpush==1.14.0
+cryptography==41.0.3

@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch() # يجب أن يكون هذا السطر في البداية تماماً لمنع حظر الشبكة (Timeout)
+eventlet.monkey_patch()
 
 import os
 import secrets
@@ -21,10 +21,10 @@ CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # --- إعدادات الاتصال بقاعدة بيانات Hostinger ---
-DB_HOST = '193.203.168.175' # استخدام الـ IP المباشر
+DB_HOST = '193.203.168.175'
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
-DB_PASS = 'kaisi@0Ahmed'
+DB_PASS = 'kaisi@0Ahmed' # ⚠️ 
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
@@ -265,7 +265,6 @@ def update_task_status(task_id):
                 existing_images = parsed if isinstance(parsed, list) else [task['image_url']]
             except: existing_images = [task['image_url']]
 
-        # الصور تأتي كروابط جاهزة من Hostinger
         new_images = data.get('images', []) if isinstance(data.get('images'), list) else []
         all_images = existing_images + new_images
         final_image_json = json.dumps(all_images) if all_images else None
@@ -347,6 +346,14 @@ def handle_zones():
             zones = cursor.fetchall()
             conn.close(); return jsonify({'success': True, 'zones': zones})
 
-if __name__ == '__main__':
+# ---------------------------------------------------------
+# فرض تشغيل إنشاء الجداول عند بدء السيرفر لتفادي الانهيار الصامت
+try:
     init_db()
+    print("✅ تم الاتصال بقاعدة بيانات Hostinger وإنشاء الجداول بنجاح!")
+except Exception as e:
+    print(f"❌ خطأ حرج في الاتصال بقاعدة البيانات: {e}")
+# ---------------------------------------------------------
+
+if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
