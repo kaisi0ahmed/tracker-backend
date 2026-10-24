@@ -24,7 +24,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 DB_HOST = '193.203.168.175'
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
-DB_PASS = 'kaisi@0Ahmed' # ⚠️
+DB_PASS = 'kaisi@0Ahmed' # تم اعتماد كلمة المرور الخاصة بك
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
@@ -46,7 +46,6 @@ def init_db():
         cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key_name VARCHAR(100) PRIMARY KEY, value TEXT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions (user_id INT, endpoint TEXT, p256dh TEXT, auth TEXT, UNIQUE(user_id, endpoint(255)))''')
         
-        # التحديثات المعمارية الجديدة (إضافة أعمدة بدون تدمير البيانات)
         try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
         except: pass
         try: cursor.execute("ALTER TABLE tasks ADD COLUMN is_alerted TINYINT(1) DEFAULT 0")
@@ -73,7 +72,6 @@ def init_db():
             cursor.execute('INSERT INTO settings (key_name, value) VALUES (%s, %s)', ('vapid_public', VAPID_PUBLIC_KEY))
     conn.close()
 
-# خوارزمية فحص النطاق الجغرافي (Ray-Casting Algorithm)
 def is_inside_polygon(lat, lng, poly_coords):
     try:
         if len(poly_coords) == 1 and isinstance(poly_coords[0][0], list): poly_coords = poly_coords[0]
@@ -91,7 +89,6 @@ def is_inside_polygon(lat, lng, poly_coords):
         return inside
     except: return True
 
-# مهمة مجدولة تعمل في الخلفية لمراقبة مواعيد المهام وإرسال التنبيهات
 def scheduled_task_alerts():
     while True:
         try:
@@ -107,7 +104,7 @@ def scheduled_task_alerts():
                     send_web_push(t['assigned_to'], "تذكير بالموعد", msg)
             conn.close()
         except: pass
-        eventlet.sleep(60) # الفحص كل دقيقة
+        eventlet.sleep(60)
 
 def send_web_push(user_id, title, message):
     try:
@@ -187,7 +184,6 @@ def handle_location(data):
         now = datetime.utcnow(); recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_str))
         
-        # فحص السياج الجغرافي (Geofencing)
         if user['zone_id']:
             cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
             zone = cursor.fetchone()
@@ -215,10 +211,48 @@ def update_profile_image():
 def get_employees():
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        if request.current_user['role'] == 'admin': cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')")
-        else: cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
+        if request.current_user['role'] == 'admin': cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')")
+        else: cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
         employees = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'employees': employees})
+
+@app.route('/api/users', methods=['POST'])
+def create_user():
+    if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    hashed_password = generate_password_hash(data.get('password'))
+    emp_id = f"E{int(datetime.now().timestamp())}"
+    zone_id = int(data.get('zone_id')) if data.get('zone_id') else None
+    team_id = int(data.get('team_id')) if data.get('team_id') else None
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        try:
+            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
+                        (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
+        except pymysql.err.IntegrityError:
+            conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
+    conn.close(); return jsonify({'success': True})
+
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    zone_id = int(data.get('zone_id')) if data.get('zone_id') else None
+    team_id = int(data.get('team_id')) if data.get('team_id') else None
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        try:
+            query = "UPDATE users SET name=%s, phone=%s, role=%s, job_title=%s, zone_id=%s, team_id=%s"
+            params = [data.get('name'), data.get('phone'), data.get('role'), data.get('job_title'), zone_id, team_id]
+            if data.get('password'):
+                query += ", password_hash=%s"
+                params.append(generate_password_hash(data.get('password')))
+            query += " WHERE id=%s"
+            params.append(user_id)
+            cursor.execute(query, params)
+        except pymysql.err.IntegrityError:
+            conn.close(); return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مستخدم لموظف آخر'}), 409
+    conn.close(); return jsonify({'success': True})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -325,16 +359,40 @@ def get_latest_locations():
 def get_location_history(user_id):
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        # يدعم الآن فلترة التاريخ عبر request.args
         target_date = request.args.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
         cursor.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = %s AND DATE(recorded_at) = %s ORDER BY recorded_at ASC', (user_id, target_date))
         history = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'history': history})
 
+@app.route('/api/reports', methods=['GET'])
+def get_reports():
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        base_query = "SELECT u.name as emp_name, u.job_title, t_team.name as team_name, COUNT(t.id) as total_tasks, SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) as completed_tasks, SUM(CASE WHEN t.status = 'delayed' THEN 1 ELSE 0 END) as delayed_tasks, SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks FROM users u LEFT JOIN tasks t ON u.id = t.assigned_to LEFT JOIN teams t_team ON u.team_id = t_team.id WHERE u.role = 'employee'"
+        if request.current_user['role'] == 'admin': cursor.execute(base_query + ' GROUP BY u.id')
+        else: cursor.execute(base_query + ' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) GROUP BY u.id', (request.current_user['id'],))
+        reports = cursor.fetchall()
+    conn.close()
+    for r in reports:
+        for k in ['total_tasks', 'completed_tasks', 'delayed_tasks', 'in_progress_tasks']: r[k] = int(r[k]) if r[k] else 0
+    return jsonify({'success': True, 'reports': reports})
+
+@app.route('/api/zones', methods=['GET', 'POST'])
+def handle_zones():
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        if request.method == 'POST':
+            data = request.get_json()
+            cursor.execute('INSERT INTO zones (name, coordinates_json, color) VALUES (%s, %s, %s)', (data.get('name'), data.get('coordinates_json'), data.get('color', '#3b82f6')))
+            conn.close(); return jsonify({'success': True})
+        else: 
+            cursor.execute('SELECT * FROM zones')
+            zones = cursor.fetchall()
+            conn.close(); return jsonify({'success': True, 'zones': zones})
+
 try:
     init_db()
-    eventlet.spawn(scheduled_task_alerts) # تشغيل الجدولة الزمنية للمهام
-    print("✅ System Ready: DB Connected, Geofencing & Schedulers Active!")
+    eventlet.spawn(scheduled_task_alerts)
 except Exception as e: print(f"❌ Error: {e}")
 
 if __name__ == '__main__':
