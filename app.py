@@ -28,7 +28,6 @@ app.json = CustomJSONProvider(app)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- إعدادات الاتصال بقاعدة بيانات Hostinger ---
 DB_HOST = '193.203.168.175'
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
@@ -62,6 +61,9 @@ def init_db():
         try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
         except: pass
         try: cursor.execute("ALTER TABLE tasks ADD COLUMN is_alerted TINYINT(1) DEFAULT 0")
+        except: pass
+        # توسيع حقل الصور ليدعم نظام الأوفلاين (Base64)
+        try: cursor.execute("ALTER TABLE tasks MODIFY image_url LONGTEXT")
         except: pass
         
         cursor.execute('SELECT * FROM users WHERE role = "admin"')
@@ -137,12 +139,12 @@ def require_auth():
     if request.path.startswith('/socket.io'): return
     if request.path.endswith('/login'): return
     if request.path.endswith('/vapid-public-key'): return
-    if request.path.endswith('/location') and request.method == 'POST': return # مستثنى لمعالجة المسار البديل
+    if request.path.endswith('/location') and request.method == 'POST': return
+    if '/sync/' in request.path and request.method == 'POST': return # استثناء مسارات المزامنة لتدقيقها داخلياً
     
     token = request.headers.get('Authorization')
     if not token: return jsonify({'error': 'Unauthorized'}), 401
     token = token.replace('Bearer ', '')
-    
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
@@ -151,8 +153,7 @@ def require_auth():
         conn.close()
         if not user: return jsonify({'error': 'Unauthorized'}), 401
         request.current_user = user
-    except Exception as e:
-        return jsonify({'error': 'Database Error'}), 500
+    except Exception as e: return jsonify({'error': 'Database Error'}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -194,16 +195,18 @@ def handle_auth(data):
         if user['role'] == 'admin': join_room('admins')
         elif user['role'] == 'manager': join_room(f"manager_{user['team_id']}")
 
-# المعالجة الموحدة لتسجيل الإحداثيات
-def process_incoming_location(user, lat, lng):
+def process_incoming_location(user, lat, lng, recorded_at_db=None, is_offline=0):
     user_id = user['id']
-    baghdad_now = datetime.utcnow() + timedelta(hours=3)
-    recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
-    recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
+    if not recorded_at_db:
+        baghdad_now = datetime.utcnow() + timedelta(hours=3)
+        recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
+        recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
+    else:
+        recorded_at_display = recorded_at_db # تبسيط عرض الوقت للأوفلاين
     
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_db))
+        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, is_offline, recorded_at_db))
         if user['zone_id']:
             cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
             zone = cursor.fetchone()
@@ -218,7 +221,6 @@ def process_incoming_location(user, lat, lng):
     socketio.emit('new_location', loc_data, room='admins')
     if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
 
-# مسار Socket
 @socketio.on('send_location')
 def handle_location(data):
     token = data.get('token')
@@ -230,7 +232,6 @@ def handle_location(data):
     if user and user['role'] == 'employee':
         process_incoming_location(user, data.get('lat'), data.get('lng'))
 
-# المسار البديل والجديد (HTTP Fallback)
 @app.route('/api/location', methods=['POST'])
 def api_fallback_location():
     data = request.get_json()
@@ -243,20 +244,83 @@ def api_fallback_location():
         cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
         user = cursor.fetchone()
     conn.close()
-    
     if user and user['role'] == 'employee':
         process_incoming_location(user, data.get('lat'), data.get('lng'))
         return jsonify({'success': True})
     return jsonify({'error': 'Unauthorized'}), 401
 
+# مسار جديد: استلام حزمة إحداثيات الأوفلاين
+@app.route('/api/sync/locations', methods=['POST'])
+def sync_locations():
+    data = request.get_json()
+    token = request.headers.get('Authorization').replace('Bearer ', '')
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
+        if not user or user['role'] != 'employee': return jsonify({'error': 'Unauthorized'}), 401
+        
+        logs = data.get('logs', [])
+        for log in logs:
+            cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', 
+                          (user['id'], log['lat'], log['lng'], 1, log['recorded_at']))
+    conn.close()
+    socketio.emit('admin_notification', {'title': 'تحديث مسار متأخر', 'message': f'تمت مزامنة مسار أوفلاين للموظف {user["name"]}'}, room='admins')
+    return jsonify({'success': True})
+
+# مسار جديد: استلام حزمة تحديثات المهام الأوفلاين
+@app.route('/api/sync/tasks', methods=['POST'])
+def sync_tasks():
+    data = request.get_json()
+    token = request.headers.get('Authorization').replace('Bearer ', '')
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
+        if not user or user['role'] != 'employee': return jsonify({'error': 'Unauthorized'}), 401
+        
+        updates = data.get('updates', [])
+        for upd in updates:
+            task_id = upd['taskId']
+            cursor.execute('SELECT * FROM tasks WHERE id = %s AND assigned_to = %s', (task_id, user['id']))
+            task = cursor.fetchone()
+            if not task: continue
+            
+            existing_images = []
+            if task['image_url']:
+                try: existing_images = json.loads(task['image_url']) if isinstance(json.loads(task['image_url']), list) else [task['image_url']]
+                except: existing_images = [task['image_url']]
+
+            new_images = upd.get('images', []) if isinstance(upd.get('images'), list) else []
+            all_images = existing_images + new_images
+            final_image_json = json.dumps(all_images) if all_images else None
+
+            existing_notes = task['notes'] if task['notes'] else ""
+            new_note = upd.get('notes', "")
+            combined_notes = f"{existing_notes}\n[مزامنة أوفلاين]: {new_note}".strip() if new_note and existing_notes else new_note or existing_notes
+
+            query = 'UPDATE tasks SET status = %s'
+            params = [upd.get('status', task['status'])]
+            if combined_notes: query += ', notes = %s'; params.append(combined_notes)
+            if final_image_json is not None: query += ', image_url = %s'; params.append(final_image_json)
+            if upd.get('checklist') is not None: query += ', checklist = %s'; params.append(upd.get('checklist'))
+            query += ' WHERE id = %s'; params.append(task_id)
+            cursor.execute(query, params)
+            
+            action = "قام بمزامنة أعمال أوفلاين لمهمة"
+            msg_title = f'مزامنة ميدانية 🔄'; msg_body = f"الموظف ({user['name']}) {action}: {task['title']}"
+            cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (task['created_by'], msg_title, msg_body))
+            socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
+    conn.close()
+    socketio.emit('task_updated', {}, room='admins')
+    return jsonify({'success': True})
+
 @app.route('/api/profile/image', methods=['PUT'])
 def update_profile_image():
     data = request.get_json()
     conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('UPDATE users SET profile_image = %s WHERE id = %s', (data.get('image_url'), request.current_user['id']))
-    conn.close()
-    return jsonify({'success': True})
+    with conn.cursor() as cursor: cursor.execute('UPDATE users SET profile_image = %s WHERE id = %s', (data.get('image_url'), request.current_user['id']))
+    conn.close(); return jsonify({'success': True})
 
 @app.route('/api/users/employees', methods=['GET'])
 def get_employees():
@@ -277,11 +341,8 @@ def create_user():
     team_id = int(data.get('team_id')) if data.get('team_id') else None
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        try:
-            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
-                        (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
-        except pymysql.err.IntegrityError:
-            conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
+        try: cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
+        except pymysql.err.IntegrityError: conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
     conn.close(); return jsonify({'success': True})
 
 @app.route('/api/users/<int:user_id>', methods=['PUT'])
@@ -295,14 +356,10 @@ def update_user(user_id):
         try:
             query = "UPDATE users SET name=%s, phone=%s, role=%s, job_title=%s, zone_id=%s, team_id=%s"
             params = [data.get('name'), data.get('phone'), data.get('role'), data.get('job_title'), zone_id, team_id]
-            if data.get('password'):
-                query += ", password_hash=%s"
-                params.append(generate_password_hash(data.get('password')))
-            query += " WHERE id=%s"
-            params.append(user_id)
+            if data.get('password'): query += ", password_hash=%s"; params.append(generate_password_hash(data.get('password')))
+            query += " WHERE id=%s"; params.append(user_id)
             cursor.execute(query, params)
-        except pymysql.err.IntegrityError:
-            conn.close(); return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مستخدم لموظف آخر'}), 409
+        except pymysql.err.IntegrityError: conn.close(); return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مستخدم لموظف آخر'}), 409
     conn.close(); return jsonify({'success': True})
 
 @app.route('/api/stats', methods=['GET'])
@@ -317,8 +374,7 @@ def get_stats():
             cursor.execute("SELECT COUNT(*) as c FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); emp_count = cursor.fetchone()['c']
             cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); total_tasks = cursor.fetchone()['c']
             cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'completed' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); completed_tasks = cursor.fetchone()['c']
-    conn.close()
-    return jsonify({'success': True, 'stats': {'employees': emp_count, 'total_tasks': total_tasks, 'completed_tasks': completed_tasks, 'pending_tasks': total_tasks - completed_tasks}})
+    conn.close(); return jsonify({'success': True, 'stats': {'employees': emp_count, 'total_tasks': total_tasks, 'completed_tasks': completed_tasks, 'pending_tasks': total_tasks - completed_tasks}})
 
 @app.route('/api/tasks/all', methods=['GET'])
 def get_all_tasks():
@@ -335,8 +391,7 @@ def create_task():
     checklist_json = json.dumps([{"title": item, "is_completed": False, "note": ""} for item in data.get('checklist', [])], ensure_ascii=False) if data.get('checklist') else None
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        cursor.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
-                     (data['title'], data['assigned_to'], request.current_user['id'], data['lat'], data['lng'], data['due_date'], checklist_json, data.get('recurrence', 'none')))
+        cursor.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', (data['title'], data['assigned_to'], request.current_user['id'], data['lat'], data['lng'], data['due_date'], checklist_json, data.get('recurrence', 'none')))
         msg_title = 'مهمة جديدة 🚀'; msg_body = f"تم إسناد مهمة جديدة لك: {data['title']}"
         cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (data['assigned_to'], msg_title, msg_body))
     conn.close()
@@ -348,9 +403,7 @@ def create_task():
 @app.route('/api/tasks/my', methods=['GET'])
 def get_my_tasks():
     conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM tasks WHERE assigned_to = %s ORDER BY due_date ASC', (request.current_user['id'],))
-        tasks = cursor.fetchall()
+    with conn.cursor() as cursor: cursor.execute('SELECT * FROM tasks WHERE assigned_to = %s ORDER BY due_date ASC', (request.current_user['id'],)); tasks = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'tasks': tasks})
 
 @app.route('/api/tasks/<int:task_id>/status', methods=['PUT'])
@@ -360,9 +413,7 @@ def update_task_status(task_id):
     with conn.cursor() as cursor:
         cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
         task = cursor.fetchone()
-        if not task: 
-            conn.close()
-            return jsonify({'error': 'Not found'}), 404
+        if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
         
         existing_images = []
         if task['image_url']:
@@ -383,14 +434,11 @@ def update_task_status(task_id):
         if final_image_json is not None: query += ', image_url = %s'; params.append(final_image_json)
         if data.get('checklist') is not None: query += ', checklist = %s'; params.append(data.get('checklist'))
         query += ' WHERE id = %s'; params.append(task_id)
-        
         cursor.execute(query, params)
         
         new_status = data.get('status', task['status'])
         action = "بدأ بتنفيذ" if new_status == 'in_progress' else "أكمل" if new_status == 'completed' else "أضاف تحديثاً على"
-        
-        cursor.execute('SELECT name FROM users WHERE id = %s', (task['assigned_to'],))
-        emp_name = cursor.fetchone()['name']
+        cursor.execute('SELECT name FROM users WHERE id = %s', (task['assigned_to'],)); emp_name = cursor.fetchone()['name']
         msg_title = f'تحديث ميداني 📋'; msg_body = f"الموظف ({emp_name}) {action} مهمة: {task['title']}"
         cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (task['created_by'], msg_title, msg_body))
         socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
