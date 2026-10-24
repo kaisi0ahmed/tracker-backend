@@ -95,12 +95,9 @@ def handle_auth(data):
     user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
     conn.close()
     if user:
-        # إدخال المستخدم في "غرفة" خاصة به لاستلام إشعاراته الفورية
         join_room(f"user_{user['id']}")
-        if user['role'] == 'admin':
-            join_room('admins')
-        elif user['role'] == 'manager':
-            join_room(f"manager_{user['team_id']}")
+        if user['role'] == 'admin': join_room('admins')
+        elif user['role'] == 'manager': join_room(f"manager_{user['team_id']}")
 
 @socketio.on('send_location')
 def handle_location(data):
@@ -129,7 +126,6 @@ def handle_location(data):
             if diff_minutes > 30 and not prev.get('alert_sent'):
                 alert_msg = f"الموظف {user['name']} متوقف في نفس المكان منذ أكثر من 30 دقيقة!"
                 socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
-                if user['team_id']: socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room=f"manager_{user['team_id']}")
                 employee_tracking[user_id]['alert_sent'] = True
     else:
         employee_tracking[user_id] = {'lat': lat, 'lng': lng, 'last_moved': now, 'alert_sent': False}
@@ -212,11 +208,8 @@ def create_task():
     conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (data['assigned_to'], msg_title, msg_body))
     conn.commit(); conn.close()
     
-    # بث الإشعار اللحظي للموظف المعني فوراً
     socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{data['assigned_to']}")
-    # تحديث لوحة التحكم للمدراء الآخرين
     socketio.emit('task_updated', {}, room='admins')
-    
     return jsonify({'success': True})
 
 @app.route('/api/tasks/my', methods=['GET'])
@@ -232,34 +225,47 @@ def update_task_status(task_id):
     task = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
     if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
     
-    image_url = task['image_url']
-    if data.get('image') and ',' in data.get('image'):
+    # معالجة الصور المتعددة وتخزينها كمصفوفة JSON
+    existing_images = []
+    if task['image_url']:
         try:
-            img_data = base64.b64decode(data.get('image').split(',')[1])
-            filename = f"task_{task_id}_{uuid.uuid4().hex[:8]}.jpg"
-            with open(os.path.join(UPLOAD_FOLDER, filename), 'wb') as f: f.write(img_data)
-            image_url = f"/static/uploads/{filename}"
-        except Exception: pass
+            parsed = json.loads(task['image_url'])
+            existing_images = parsed if isinstance(parsed, list) else [task['image_url']]
+        except: existing_images = [task['image_url']]
 
-    query = 'UPDATE tasks SET status = ?'; params = [data.get('status')]
+    new_images = []
+    if data.get('images') and isinstance(data.get('images'), list):
+        for img_b64 in data.get('images'):
+            if ',' in img_b64:
+                try:
+                    img_data = base64.b64decode(img_b64.split(',')[1])
+                    filename = f"task_{task_id}_{uuid.uuid4().hex[:8]}.jpg"
+                    with open(os.path.join(UPLOAD_FOLDER, filename), 'wb') as f: f.write(img_data)
+                    new_images.append(f"/static/uploads/{filename}")
+                except Exception: pass
+    
+    all_images = existing_images + new_images
+    final_image_json = json.dumps(all_images) if all_images else None
+
+    query = 'UPDATE tasks SET status = ?'; params = [data.get('status', task['status'])]
     if data.get('notes') is not None: query += ', notes = ?'; params.append(data.get('notes'))
-    if image_url is not None: query += ', image_url = ?'; params.append(image_url)
+    if final_image_json is not None: query += ', image_url = ?'; params.append(final_image_json)
     if data.get('checklist') is not None: query += ', checklist = ?'; params.append(data.get('checklist'))
     query += ' WHERE id = ?'; params.append(task_id)
     
     conn.execute(query, params)
     
-    if data.get('status') == 'completed':
+    # تنبيه الإدارة بأي تغيير يجريه الموظف (بدء، إكمال، أو تحديث خطوة)
+    new_status = data.get('status')
+    if (new_status and new_status != task['status']) or data.get('checklist'):
         emp_name = conn.execute('SELECT name FROM users WHERE id = ?', (task['assigned_to'],)).fetchone()['name']
-        msg_title = 'إنجاز مهمة ✅'
-        msg_body = f"أكمل الموظف ({emp_name}) مهمة: {task['title']}"
+        action = "بدأ بتنفيذ" if new_status == 'in_progress' else "أكمل" if new_status == 'completed' else "قام بتحديث"
+        msg_title = f'تحديث في المهمة 📋'
+        msg_body = f"الموظف ({emp_name}) {action} مهمة: {task['title']}"
         conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (task['created_by'], msg_title, msg_body))
-        # إشعار المدير لحظياً
         socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
 
     conn.commit(); conn.close()
-    
-    # تحديث واجهة الجميع
     socketio.emit('task_updated', {}, room='admins')
     return jsonify({'success': True})
 
@@ -271,8 +277,7 @@ def get_notifications():
         ids = [str(n['id']) for n in notifs]
         conn.execute(f"UPDATE notifications SET is_read = 1 WHERE id IN ({','.join(ids)})")
         conn.commit()
-    conn.close()
-    return jsonify({'success': True, 'notifications': [dict(n) for n in notifs]})
+    conn.close(); return jsonify({'success': True, 'notifications': [dict(n) for n in notifs]})
 
 @app.route('/api/location', methods=['POST'])
 def sync_location_fallback():
