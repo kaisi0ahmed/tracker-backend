@@ -1,5 +1,3 @@
-# app.py
-import sqlite3
 import os
 import secrets
 import json
@@ -7,126 +5,105 @@ import base64
 import uuid
 import math
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, emit
+import pymysql.cursors
 from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import webpush, WebPushException
 
-app = Flask(__name__, static_folder='static')
+app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-DB_NAME = 'field_management.db'
-UPLOAD_FOLDER = os.path.join('static', 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# --- إعدادات الاتصال بقاعدة بيانات Hostinger ---
+DB_HOST = 'srv1790.hstgr.io'
+DB_NAME = 'u301100000_tracker'
+DB_USER = 'u301100000_ضع_اسم_المستخدم_هنا' # استبدله باسم المستخدم الذي أنشأته
+DB_PASS = 'ضع_كلمة_المرور_هنا'             # استبدله بكلمة المرور
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
-def get_distance(lat1, lon1, lat2, lon2):
-    R = 6371e3 
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    a = math.sin(delta_phi/2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2.0)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, cursorclass=pymysql.cursors.DictCursor, autocommit=True)
 
 def init_db():
     global VAPID_PRIVATE_KEY, VAPID_PUBLIC_KEY
-    if not os.path.exists(DB_NAME):
-        conn = get_db_connection()
-        if os.path.exists('schema.sql'):
-            with open('schema.sql', 'r', encoding='utf-8') as f: conn.executescript(f.read())
-        cursor = conn.cursor()
-        admin_pass = generate_password_hash('admin123')
-        cursor.execute('INSERT INTO users (name, phone, email, emp_id, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)', ('مدير النظام', '07000000000', 'admin@domain.com', 'A001', admin_pass, 'admin'))
-        conn.commit(); conn.close()
-    
     conn = get_db_connection()
-    try: conn.execute("ALTER TABLE tasks ADD COLUMN image_url TEXT")
-    except sqlite3.OperationalError: pass
-    try: conn.execute("ALTER TABLE tasks ADD COLUMN checklist TEXT")
-    except sqlite3.OperationalError: pass
-    try: conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT DEFAULT 'none'")
-    except sqlite3.OperationalError: pass
-    
-    conn.execute('CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT, is_read BOOLEAN DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)')
-    conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    conn.execute('CREATE TABLE IF NOT EXISTS push_subscriptions (user_id INTEGER, endpoint TEXT, p256dh TEXT, auth TEXT, UNIQUE(user_id, endpoint))')
-    
-    vapid = conn.execute('SELECT value FROM settings WHERE key="vapid_private"').fetchone()
-    if vapid:
-        VAPID_PRIVATE_KEY = vapid['value']
-        VAPID_PUBLIC_KEY = conn.execute('SELECT value FROM settings WHERE key="vapid_public"').fetchone()['value']
-    else:
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        priv_bytes = private_key.private_numbers().private_value.to_bytes(32, 'big')
-        VAPID_PRIVATE_KEY = base64.urlsafe_b64encode(priv_bytes).decode('utf-8').rstrip('=')
+    with conn.cursor() as cursor:
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), phone VARCHAR(50) UNIQUE, email VARCHAR(255), emp_id VARCHAR(50), password_hash VARCHAR(255), role VARCHAR(50), job_title VARCHAR(100), zone_id INT, team_id INT, token VARCHAR(255))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255), assigned_to INT, created_by INT, lat FLOAT, lng FLOAT, due_date DATETIME, status VARCHAR(50) DEFAULT 'new', notes TEXT, image_url TEXT, checklist TEXT, recurrence VARCHAR(50) DEFAULT 'none')''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, title VARCHAR(255) NOT NULL, message TEXT, is_read TINYINT(1) DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS teams (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), manager_id INT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS zones (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), coordinates_json TEXT, color VARCHAR(50))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS location_logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, lat FLOAT, lng FLOAT, is_offline_sync TINYINT(1) DEFAULT 0, recorded_at DATETIME)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key_name VARCHAR(100) PRIMARY KEY, value TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions (user_id INT, endpoint TEXT, p256dh TEXT, auth TEXT, UNIQUE(user_id, endpoint(255)))''')
         
-        pub_numbers = private_key.public_key().public_numbers()
-        pub_bytes = b'\x04' + pub_numbers.x.to_bytes(32, 'big') + pub_numbers.y.to_bytes(32, 'big')
-        VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(pub_bytes).decode('utf-8').rstrip('=')
+        cursor.execute('SELECT * FROM users WHERE role = "admin"')
+        if not cursor.fetchone():
+            cursor.execute('INSERT INTO users (name, phone, email, emp_id, password_hash, role) VALUES (%s, %s, %s, %s, %s, %s)', ('مدير النظام', '07000000000', 'admin@domain.com', 'A001', generate_password_hash('admin123'), 'admin'))
         
-        conn.execute('INSERT INTO settings (key, value) VALUES (?, ?)', ('vapid_private', VAPID_PRIVATE_KEY))
-        conn.execute('INSERT INTO settings (key, value) VALUES (?, ?)', ('vapid_public', VAPID_PUBLIC_KEY))
-    
-    conn.commit(); conn.close()
+        cursor.execute('SELECT value FROM settings WHERE key_name="vapid_private"')
+        vapid = cursor.fetchone()
+        if vapid:
+            VAPID_PRIVATE_KEY = vapid['value']
+            cursor.execute('SELECT value FROM settings WHERE key_name="vapid_public"')
+            VAPID_PUBLIC_KEY = cursor.fetchone()['value']
+        else:
+            private_key = ec.generate_private_key(ec.SECP256R1())
+            priv_bytes = private_key.private_numbers().private_value.to_bytes(32, 'big')
+            VAPID_PRIVATE_KEY = base64.urlsafe_b64encode(priv_bytes).decode('utf-8').rstrip('=')
+            pub_numbers = private_key.public_key().public_numbers()
+            pub_bytes = b'\x04' + pub_numbers.x.to_bytes(32, 'big') + pub_numbers.y.to_bytes(32, 'big')
+            VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(pub_bytes).decode('utf-8').rstrip('=')
+            cursor.execute('INSERT INTO settings (key_name, value) VALUES (%s, %s)', ('vapid_private', VAPID_PRIVATE_KEY))
+            cursor.execute('INSERT INTO settings (key_name, value) VALUES (%s, %s)', ('vapid_public', VAPID_PUBLIC_KEY))
+    conn.close()
 
 def send_web_push(user_id, title, message):
     try:
         conn = get_db_connection()
-        subs = conn.execute('SELECT * FROM push_subscriptions WHERE user_id = ?', (user_id,)).fetchall()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM push_subscriptions WHERE user_id = %s', (user_id,))
+            subs = cursor.fetchall()
         conn.close()
         for sub in subs:
             try:
-                webpush(
-                    subscription_info={"endpoint": sub['endpoint'], "keys": {"p256dh": sub['p256dh'], "auth": sub['auth']}},
-                    data=json.dumps({"title": title, "message": message}),
-                    vapid_private_key=VAPID_PRIVATE_KEY,
-                    vapid_claims={"sub": "mailto:admin@kaisi.dev"}
-                )
-            except Exception as e: pass
-    except Exception as e: pass
+                webpush(subscription_info={"endpoint": sub['endpoint'], "keys": {"p256dh": sub['p256dh'], "auth": sub['auth']}}, data=json.dumps({"title": title, "message": message}), vapid_private_key=VAPID_PRIVATE_KEY, vapid_claims={"sub": "mailto:admin@kaisi.dev"})
+            except Exception: pass
+    except Exception: pass
 
 @app.before_request
 def require_auth():
-    if request.method == 'OPTIONS': return
-    if request.endpoint == 'login' or request.endpoint == 'serve_static': return
+    if request.method == 'OPTIONS' or request.endpoint == 'login': return
     token = request.headers.get('Authorization')
     if not token: return jsonify({'error': 'Unauthorized'}), 401
     token = token.replace('Bearer ', '')
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
     conn.close()
     if not user: return jsonify({'error': 'Unauthorized'}), 401
-    request.current_user = dict(user)
+    request.current_user = user
 
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE phone = ?', (data.get('phone'),)).fetchone()
-    if user and check_password_hash(user['password_hash'], data.get('password')):
-        token = secrets.token_hex(32)
-        conn.execute('UPDATE users SET token = ? WHERE id = ?', (token, user['id']))
-        conn.commit(); conn.close()
-        user_data = dict(user); user_data.pop('password_hash'); user_data['token'] = token
-        return jsonify({'success': True, 'user': user_data})
-    conn.close()
-    return jsonify({'error': 'Unauthorized'}), 401
-
-@app.route('/static/uploads/<path:filename>')
-def serve_static(filename): return send_from_directory(UPLOAD_FOLDER, filename)
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE phone = %s', (data.get('phone'),))
+        user = cursor.fetchone()
+        if user and check_password_hash(user['password_hash'], data.get('password')):
+            token = secrets.token_hex(32)
+            cursor.execute('UPDATE users SET token = %s WHERE id = %s', (token, user['id']))
+            user['token'] = token; user.pop('password_hash')
+            conn.close(); return jsonify({'success': True, 'user': user})
+    conn.close(); return jsonify({'error': 'Unauthorized'}), 401
 
 @app.route('/api/vapid-public-key', methods=['GET'])
 def get_vapid_key():
@@ -138,17 +115,18 @@ def subscribe():
     endpoint = data.get('endpoint'); keys = data.get('keys', {})
     if not endpoint: return jsonify({'error': 'Missing endpoint'}), 400
     conn = get_db_connection()
-    conn.execute('INSERT OR REPLACE INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)',
-                 (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth')))
-    conn.commit(); conn.close()
-    return jsonify({'success': True})
+    with conn.cursor() as cursor:
+        cursor.execute('''INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE p256dh=%s, auth=%s''', (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth'), keys.get('p256dh'), keys.get('auth')))
+    conn.close(); return jsonify({'success': True})
 
 @socketio.on('authenticate')
 def handle_auth(data):
     token = data.get('token')
     if not token: return
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
     conn.close()
     if user:
         join_room(f"user_{user['id']}")
@@ -159,46 +137,31 @@ def handle_auth(data):
 def handle_location(data):
     token = data.get('token')
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE token = ?', (token,)).fetchone()
-    if not user or user['role'] != 'employee':
-        conn.close(); return
-
-    lat = data.get('lat'); lng = data.get('lng'); user_id = user['id']
-    now = datetime.utcnow(); recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
-
-    conn.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (?, ?, ?, ?, ?)', (user_id, lat, lng, False, recorded_at_str))
-    loc_data = { 'user_id': user_id, 'name': user['name'], 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_str }
-    
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+        user = cursor.fetchone()
+        if not user or user['role'] != 'employee': return
+        lat = data.get('lat'); lng = data.get('lng'); user_id = user['id']
+        now = datetime.utcnow(); recorded_at_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, 0, recorded_at_str))
+        loc_data = { 'user_id': user_id, 'name': user['name'], 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_str }
+    conn.close()
     socketio.emit('new_location', loc_data, room='admins')
     if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
-
-    if user_id in employee_tracking:
-        prev = employee_tracking[user_id]
-        distance = get_distance(prev['lat'], prev['lng'], lat, lng)
-        if distance > 30: 
-            employee_tracking[user_id] = {'lat': lat, 'lng': lng, 'last_moved': now, 'alert_sent': False}
-        else:
-            diff_minutes = (now - prev['last_moved']).total_seconds() / 60
-            if diff_minutes > 30 and not prev.get('alert_sent'):
-                alert_msg = f"الموظف {user['name']} متوقف منذ أكثر من 30 دقيقة!"
-                socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
-                employee_tracking[user_id]['alert_sent'] = True
-    else:
-        employee_tracking[user_id] = {'lat': lat, 'lng': lng, 'last_moved': now, 'alert_sent': False}
-
-    conn.commit(); conn.close()
 
 @app.route('/api/teams', methods=['GET', 'POST'])
 def handle_teams():
     if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
     conn = get_db_connection()
-    if request.method == 'POST':
-        data = request.get_json()
-        conn.execute('INSERT INTO teams (name, manager_id) VALUES (?, ?)', (data.get('name'), data.get('manager_id')))
-        conn.commit(); conn.close(); return jsonify({'success': True})
-    else:
-        teams = conn.execute('SELECT t.*, u.name as manager_name FROM teams t LEFT JOIN users u ON t.manager_id = u.id').fetchall()
-        conn.close(); return jsonify({'success': True, 'teams': [dict(t) for t in teams]})
+    with conn.cursor() as cursor:
+        if request.method == 'POST':
+            data = request.get_json()
+            cursor.execute('INSERT INTO teams (name, manager_id) VALUES (%s, %s)', (data.get('name'), data.get('manager_id')))
+            conn.close(); return jsonify({'success': True})
+        else:
+            cursor.execute('SELECT t.*, u.name as manager_name FROM teams t LEFT JOIN users u ON t.manager_id = u.id')
+            teams = cursor.fetchall()
+            conn.close(); return jsonify({'success': True, 'teams': teams})
 
 @app.route('/api/users', methods=['POST'])
 def create_user():
@@ -209,182 +172,177 @@ def create_user():
     zone_id = int(data.get('zone_id')) if data.get('zone_id') else None
     team_id = int(data.get('team_id')) if data.get('team_id') else None
     conn = get_db_connection()
-    try:
-        conn.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
-                    (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
+    with conn.cursor() as cursor:
+        try:
+            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, zone_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
+                        (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
+        except pymysql.err.IntegrityError:
+            conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
     conn.close(); return jsonify({'success': True})
 
 @app.route('/api/users/managers', methods=['GET'])
 def get_managers():
     conn = get_db_connection()
-    managers = conn.execute("SELECT id, name FROM users WHERE role = 'manager'").fetchall(); conn.close()
-    return jsonify({'success': True, 'managers': [dict(m) for m in managers]})
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT id, name FROM users WHERE role = 'manager'")
+        managers = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'managers': managers})
 
 @app.route('/api/users/employees', methods=['GET'])
 def get_employees():
     conn = get_db_connection()
-    if request.current_user['role'] == 'admin': users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')").fetchall()
-    else: users = conn.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchall()
-    conn.close(); return jsonify({'success': True, 'employees': [dict(u) for u in users]})
+    with conn.cursor() as cursor:
+        if request.current_user['role'] == 'admin': cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')")
+        else: cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
+        employees = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'employees': employees})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     conn = get_db_connection()
-    if request.current_user['role'] == 'admin':
-        emp_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'employee'").fetchone()[0]
-        total_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        completed_tasks = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'").fetchone()[0]
-    else:
-        emp_count = conn.execute("SELECT COUNT(*) FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchone()[0]
-        total_tasks = conn.execute("SELECT COUNT(t.id) FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchone()[0]
-        completed_tasks = conn.execute("SELECT COUNT(t.id) FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'completed' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)", (request.current_user['id'],)).fetchone()[0]
+    with conn.cursor() as cursor:
+        if request.current_user['role'] == 'admin':
+            cursor.execute("SELECT COUNT(*) as c FROM users WHERE role = 'employee'"); emp_count = cursor.fetchone()['c']
+            cursor.execute("SELECT COUNT(*) as c FROM tasks"); total_tasks = cursor.fetchone()['c']
+            cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'completed'"); completed_tasks = cursor.fetchone()['c']
+        else:
+            cursor.execute("SELECT COUNT(*) as c FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); emp_count = cursor.fetchone()['c']
+            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); total_tasks = cursor.fetchone()['c']
+            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'completed' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],)); completed_tasks = cursor.fetchone()['c']
     conn.close()
     return jsonify({'success': True, 'stats': {'employees': emp_count, 'total_tasks': total_tasks, 'completed_tasks': completed_tasks, 'pending_tasks': total_tasks - completed_tasks}})
 
 @app.route('/api/tasks/all', methods=['GET'])
 def get_all_tasks():
     conn = get_db_connection()
-    if request.current_user['role'] == 'admin': tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id ORDER BY tasks.due_date DESC").fetchall()
-    else: tasks = conn.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id WHERE users.team_id IN (SELECT id FROM teams WHERE manager_id = ?) ORDER BY tasks.due_date DESC", (request.current_user['id'],)).fetchall()
-    conn.close(); return jsonify({'success': True, 'tasks': [dict(row) for row in tasks]})
+    with conn.cursor() as cursor:
+        if request.current_user['role'] == 'admin': cursor.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id ORDER BY tasks.due_date DESC")
+        else: cursor.execute("SELECT tasks.*, users.name as assignee_name FROM tasks LEFT JOIN users ON tasks.assigned_to = users.id WHERE users.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY tasks.due_date DESC", (request.current_user['id'],))
+        tasks = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'tasks': tasks})
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
     data = request.get_json()
     checklist_json = json.dumps([{"title": item, "is_completed": False} for item in data.get('checklist', [])], ensure_ascii=False) if data.get('checklist') else None
     conn = get_db_connection()
-    conn.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
-                 (data['title'], data['assigned_to'], request.current_user['id'], data['lat'], data['lng'], data['due_date'], checklist_json, data.get('recurrence', 'none')))
-    
-    msg_title = 'مهمة جديدة 🚀'
-    msg_body = f"تم إسناد مهمة جديدة لك: {data['title']}"
-    conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (data['assigned_to'], msg_title, msg_body))
-    conn.commit(); conn.close()
+    with conn.cursor() as cursor:
+        cursor.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
+                     (data['title'], data['assigned_to'], request.current_user['id'], data['lat'], data['lng'], data['due_date'], checklist_json, data.get('recurrence', 'none')))
+        msg_title = 'مهمة جديدة 🚀'; msg_body = f"تم إسناد مهمة جديدة لك: {data['title']}"
+        cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (data['assigned_to'], msg_title, msg_body))
+    conn.close()
     
     socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{data['assigned_to']}")
     socketio.emit('task_updated', {}, room='admins')
-    
-    # إرسال إشعار خلفية (Web Push)
     send_web_push(data['assigned_to'], msg_title, msg_body)
     return jsonify({'success': True})
 
 @app.route('/api/tasks/my', methods=['GET'])
 def get_my_tasks():
     conn = get_db_connection()
-    tasks = conn.execute('SELECT * FROM tasks WHERE assigned_to = ? ORDER BY due_date ASC', (request.current_user['id'],)).fetchall(); conn.close()
-    return jsonify({'success': True, 'tasks': [dict(row) for row in tasks]})
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM tasks WHERE assigned_to = %s ORDER BY due_date ASC', (request.current_user['id'],))
+        tasks = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'tasks': tasks})
 
 @app.route('/api/tasks/<int:task_id>/status', methods=['PUT'])
 def update_task_status(task_id):
     data = request.get_json()
     conn = get_db_connection()
-    task = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
-    if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
-    
-    existing_images = []
-    if task['image_url']:
-        try:
-            parsed = json.loads(task['image_url'])
-            existing_images = parsed if isinstance(parsed, list) else [task['image_url']]
-        except: existing_images = [task['image_url']]
-
-    new_images = []
-    if data.get('images') and isinstance(data.get('images'), list):
-        for img_b64 in data.get('images'):
-            if ',' in img_b64:
-                try:
-                    img_data = base64.b64decode(img_b64.split(',')[1])
-                    filename = f"task_{task_id}_{uuid.uuid4().hex[:8]}.jpg"
-                    with open(os.path.join(UPLOAD_FOLDER, filename), 'wb') as f: f.write(img_data)
-                    new_images.append(f"/static/uploads/{filename}")
-                except Exception: pass
-    
-    all_images = existing_images + new_images
-    final_image_json = json.dumps(all_images) if all_images else None
-
-    query = 'UPDATE tasks SET status = ?'; params = [data.get('status', task['status'])]
-    if data.get('notes') is not None: query += ', notes = ?'; params.append(data.get('notes'))
-    if final_image_json is not None: query += ', image_url = ?'; params.append(final_image_json)
-    if data.get('checklist') is not None: query += ', checklist = ?'; params.append(data.get('checklist'))
-    query += ' WHERE id = ?'; params.append(task_id)
-    
-    conn.execute(query, params)
-    
-    new_status = data.get('status')
-    if (new_status and new_status != task['status']) or data.get('checklist'):
-        emp_name = conn.execute('SELECT name FROM users WHERE id = ?', (task['assigned_to'],)).fetchone()['name']
-        action = "بدأ بتنفيذ" if new_status == 'in_progress' else "أكمل" if new_status == 'completed' else "قام بتحديث"
-        msg_title = f'تحديث في المهمة 📋'
-        msg_body = f"الموظف ({emp_name}) {action} مهمة: {task['title']}"
-        conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (task['created_by'], msg_title, msg_body))
-        socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
+        task = cursor.fetchone()
+        if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
         
-        # إرسال إشعار للمدير (Web Push)
-        send_web_push(task['created_by'], msg_title, msg_body)
+        existing_images = []
+        if task['image_url']:
+            try:
+                parsed = json.loads(task['image_url'])
+                existing_images = parsed if isinstance(parsed, list) else [task['image_url']]
+            except: existing_images = [task['image_url']]
 
-    conn.commit(); conn.close()
+        # الصور تأتي كروابط جاهزة من Hostinger
+        new_images = data.get('images', []) if isinstance(data.get('images'), list) else []
+        all_images = existing_images + new_images
+        final_image_json = json.dumps(all_images) if all_images else None
+
+        query = 'UPDATE tasks SET status = %s'
+        params = [data.get('status', task['status'])]
+        if data.get('notes') is not None: query += ', notes = %s'; params.append(data.get('notes'))
+        if final_image_json is not None: query += ', image_url = %s'; params.append(final_image_json)
+        if data.get('checklist') is not None: query += ', checklist = %s'; params.append(data.get('checklist'))
+        query += ' WHERE id = %s'; params.append(task_id)
+        
+        cursor.execute(query, params)
+        
+        new_status = data.get('status')
+        if (new_status and new_status != task['status']) or data.get('checklist'):
+            cursor.execute('SELECT name FROM users WHERE id = %s', (task['assigned_to'],))
+            emp_name = cursor.fetchone()['name']
+            action = "بدأ بتنفيذ" if new_status == 'in_progress' else "أكمل" if new_status == 'completed' else "قام بتحديث"
+            msg_title = f'تحديث في المهمة 📋'; msg_body = f"الموظف ({emp_name}) {action} مهمة: {task['title']}"
+            cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (task['created_by'], msg_title, msg_body))
+            socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
+            send_web_push(task['created_by'], msg_title, msg_body)
+    conn.close()
     socketio.emit('task_updated', {}, room='admins')
     return jsonify({'success': True})
 
 @app.route('/api/notifications', methods=['GET'])
 def get_notifications():
     conn = get_db_connection()
-    notifs = conn.execute('SELECT * FROM notifications WHERE user_id = ? AND is_read = 0 ORDER BY created_at DESC', (request.current_user['id'],)).fetchall()
-    if notifs:
-        ids = [str(n['id']) for n in notifs]
-        conn.execute(f"UPDATE notifications SET is_read = 1 WHERE id IN ({','.join(ids)})")
-        conn.commit()
-    conn.close(); return jsonify({'success': True, 'notifications': [dict(n) for n in notifs]})
-
-@app.route('/api/location', methods=['POST'])
-def sync_location_fallback():
-    data = request.get_json()
-    conn = get_db_connection()
-    conn.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (?, ?, ?, ?, ?)', 
-                 (request.current_user['id'], data.get('lat'), data.get('lng'), True, data.get('recorded_at', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))))
-    conn.commit(); conn.close(); return jsonify({'success': True})
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT * FROM notifications WHERE user_id = %s AND is_read = 0 ORDER BY created_at DESC', (request.current_user['id'],))
+        notifs = cursor.fetchall()
+        if notifs:
+            ids = [str(n['id']) for n in notifs]
+            cursor.execute(f"UPDATE notifications SET is_read = 1 WHERE id IN ({','.join(ids)})")
+    conn.close(); return jsonify({'success': True, 'notifications': notifs})
 
 @app.route('/api/location/latest', methods=['GET'])
 def get_latest_locations():
     conn = get_db_connection()
-    base_query = "SELECT l.user_id, l.lat, l.lng, l.recorded_at, u.name, u.job_title, u.zone_id FROM location_logs l JOIN users u ON l.user_id = u.id INNER JOIN (SELECT user_id, MAX(recorded_at) as max_date FROM location_logs GROUP BY user_id) grouped_l ON l.user_id = grouped_l.user_id AND l.recorded_at = grouped_l.max_date"
-    if request.current_user['role'] == 'admin': locations = conn.execute(base_query).fetchall()
-    else: locations = conn.execute(base_query + ' WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = ?)', (request.current_user['id'],)).fetchall()
-    conn.close(); return jsonify({'success': True, 'locations': [dict(loc) for loc in locations]})
+    with conn.cursor() as cursor:
+        base_query = "SELECT l.user_id, l.lat, l.lng, l.recorded_at, u.name, u.job_title, u.zone_id FROM location_logs l JOIN users u ON l.user_id = u.id INNER JOIN (SELECT user_id, MAX(recorded_at) as max_date FROM location_logs GROUP BY user_id) grouped_l ON l.user_id = grouped_l.user_id AND l.recorded_at = grouped_l.max_date"
+        if request.current_user['role'] == 'admin': cursor.execute(base_query)
+        else: cursor.execute(base_query + ' WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)', (request.current_user['id'],))
+        locations = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'locations': locations})
 
 @app.route('/api/location/history/<int:user_id>', methods=['GET'])
 def get_location_history(user_id):
     conn = get_db_connection()
-    locations = conn.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = ? AND date(recorded_at) = ? ORDER BY recorded_at ASC', (user_id, request.args.get('date'))).fetchall()
-    conn.close(); return jsonify({'success': True, 'history': [dict(loc) for loc in locations]})
+    with conn.cursor() as cursor:
+        cursor.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = %s AND DATE(recorded_at) = %s ORDER BY recorded_at ASC', (user_id, request.args.get('date')))
+        history = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'history': history})
 
 @app.route('/api/reports', methods=['GET'])
 def get_reports():
     conn = get_db_connection()
-    base_query = "SELECT u.name as emp_name, u.job_title, t_team.name as team_name, COUNT(t.id) as total_tasks, SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) as completed_tasks, SUM(CASE WHEN t.status = 'delayed' THEN 1 ELSE 0 END) as delayed_tasks, SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks FROM users u LEFT JOIN tasks t ON u.id = t.assigned_to LEFT JOIN teams t_team ON u.team_id = t_team.id WHERE u.role = 'employee'"
-    if request.current_user['role'] == 'admin': reports = conn.execute(base_query + ' GROUP BY u.id').fetchall()
-    else: reports = conn.execute(base_query + ' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = ?) GROUP BY u.id', (request.current_user['id'],)).fetchall()
+    with conn.cursor() as cursor:
+        base_query = "SELECT u.name as emp_name, u.job_title, t_team.name as team_name, COUNT(t.id) as total_tasks, SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) as completed_tasks, SUM(CASE WHEN t.status = 'delayed' THEN 1 ELSE 0 END) as delayed_tasks, SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks FROM users u LEFT JOIN tasks t ON u.id = t.assigned_to LEFT JOIN teams t_team ON u.team_id = t_team.id WHERE u.role = 'employee'"
+        if request.current_user['role'] == 'admin': cursor.execute(base_query + ' GROUP BY u.id')
+        else: cursor.execute(base_query + ' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) GROUP BY u.id', (request.current_user['id'],))
+        reports = cursor.fetchall()
     conn.close()
-    clean_reports = []
     for r in reports:
-        d = dict(r)
-        for key in ['total_tasks', 'completed_tasks', 'delayed_tasks', 'in_progress_tasks']: d[key] = d[key] or 0
-        clean_reports.append(d)
-    return jsonify({'success': True, 'reports': clean_reports})
+        for k in ['total_tasks', 'completed_tasks', 'delayed_tasks', 'in_progress_tasks']: r[k] = int(r[k]) if r[k] else 0
+    return jsonify({'success': True, 'reports': reports})
 
 @app.route('/api/zones', methods=['GET', 'POST'])
 def handle_zones():
     conn = get_db_connection()
-    if request.method == 'POST':
-        data = request.get_json()
-        conn.execute('INSERT INTO zones (name, coordinates_json, color) VALUES (?, ?, ?)', (data.get('name'), data.get('coordinates_json'), data.get('color', '#3b82f6')))
-        conn.commit(); conn.close(); return jsonify({'success': True})
-    else: 
-        zones = conn.execute('SELECT * FROM zones').fetchall()
-        conn.close(); return jsonify({'success': True, 'zones': [dict(z) for z in zones]})
+    with conn.cursor() as cursor:
+        if request.method == 'POST':
+            data = request.get_json()
+            cursor.execute('INSERT INTO zones (name, coordinates_json, color) VALUES (%s, %s, %s)', (data.get('name'), data.get('coordinates_json'), data.get('color', '#3b82f6')))
+            conn.close(); return jsonify({'success': True})
+        else: 
+            cursor.execute('SELECT * FROM zones')
+            zones = cursor.fetchall()
+            conn.close(); return jsonify({'success': True, 'zones': zones})
 
 if __name__ == '__main__':
     init_db()
