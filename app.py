@@ -24,7 +24,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 DB_HOST = '193.203.168.175'
 DB_NAME = 'u301100000_tracker'
 DB_USER = 'u301100000_admin1'
-DB_PASS = 'kaisi@0Ahmed' # تم اعتماد كلمة المرور الخاصة بك
+DB_PASS = 'kaisi@0Ahmed' 
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
@@ -118,19 +118,28 @@ def send_web_push(user_id, title, message):
             except: pass
     except: pass
 
+# تم إصلاح جدار الحماية بالكامل هنا لمنع تسجيل الخروج العشوائي
 @app.before_request
 def require_auth():
-    if request.method == 'OPTIONS' or request.endpoint == 'login': return
+    if request.method == 'OPTIONS': return
+    if request.path.startswith('/socket.io'): return
+    if request.path.endswith('/login'): return
+    if request.path.endswith('/vapid-public-key'): return
+    
     token = request.headers.get('Authorization')
     if not token: return jsonify({'error': 'Unauthorized'}), 401
     token = token.replace('Bearer ', '')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-    conn.close()
-    if not user: return jsonify({'error': 'Unauthorized'}), 401
-    request.current_user = user
+    
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
+            user = cursor.fetchone()
+        conn.close()
+        if not user: return jsonify({'error': 'Unauthorized'}), 401
+        request.current_user = user
+    except Exception as e:
+        return jsonify({'error': 'Database Error'}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
