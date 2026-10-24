@@ -11,6 +11,8 @@ from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, emit
+from cryptography.hazmat.primitives.asymmetric import ec
+from pywebpush import webpush, WebPushException
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
@@ -21,6 +23,8 @@ UPLOAD_FOLDER = os.path.join('static', 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 employee_tracking = {}
+VAPID_PRIVATE_KEY = None
+VAPID_PUBLIC_KEY = None
 
 def get_distance(lat1, lon1, lat2, lon2):
     R = 6371e3 
@@ -38,6 +42,7 @@ def get_db_connection():
     return conn
 
 def init_db():
+    global VAPID_PRIVATE_KEY, VAPID_PUBLIC_KEY
     if not os.path.exists(DB_NAME):
         conn = get_db_connection()
         if os.path.exists('schema.sql'):
@@ -54,8 +59,44 @@ def init_db():
     except sqlite3.OperationalError: pass
     try: conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT DEFAULT 'none'")
     except sqlite3.OperationalError: pass
+    
     conn.execute('CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT, is_read BOOLEAN DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)')
+    conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS push_subscriptions (user_id INTEGER, endpoint TEXT, p256dh TEXT, auth TEXT, UNIQUE(user_id, endpoint))')
+    
+    vapid = conn.execute('SELECT value FROM settings WHERE key="vapid_private"').fetchone()
+    if vapid:
+        VAPID_PRIVATE_KEY = vapid['value']
+        VAPID_PUBLIC_KEY = conn.execute('SELECT value FROM settings WHERE key="vapid_public"').fetchone()['value']
+    else:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        priv_bytes = private_key.private_numbers().private_value.to_bytes(32, 'big')
+        VAPID_PRIVATE_KEY = base64.urlsafe_b64encode(priv_bytes).decode('utf-8').rstrip('=')
+        
+        pub_numbers = private_key.public_key().public_numbers()
+        pub_bytes = b'\x04' + pub_numbers.x.to_bytes(32, 'big') + pub_numbers.y.to_bytes(32, 'big')
+        VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(pub_bytes).decode('utf-8').rstrip('=')
+        
+        conn.execute('INSERT INTO settings (key, value) VALUES (?, ?)', ('vapid_private', VAPID_PRIVATE_KEY))
+        conn.execute('INSERT INTO settings (key, value) VALUES (?, ?)', ('vapid_public', VAPID_PUBLIC_KEY))
+    
     conn.commit(); conn.close()
+
+def send_web_push(user_id, title, message):
+    try:
+        conn = get_db_connection()
+        subs = conn.execute('SELECT * FROM push_subscriptions WHERE user_id = ?', (user_id,)).fetchall()
+        conn.close()
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info={"endpoint": sub['endpoint'], "keys": {"p256dh": sub['p256dh'], "auth": sub['auth']}},
+                    data=json.dumps({"title": title, "message": message}),
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": "mailto:admin@kaisi.dev"}
+                )
+            except Exception as e: pass
+    except Exception as e: pass
 
 @app.before_request
 def require_auth():
@@ -86,6 +127,21 @@ def login():
 
 @app.route('/static/uploads/<path:filename>')
 def serve_static(filename): return send_from_directory(UPLOAD_FOLDER, filename)
+
+@app.route('/api/vapid-public-key', methods=['GET'])
+def get_vapid_key():
+    return jsonify({'public_key': VAPID_PUBLIC_KEY})
+
+@app.route('/api/subscribe', methods=['POST'])
+def subscribe():
+    data = request.get_json()
+    endpoint = data.get('endpoint'); keys = data.get('keys', {})
+    if not endpoint: return jsonify({'error': 'Missing endpoint'}), 400
+    conn = get_db_connection()
+    conn.execute('INSERT OR REPLACE INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)',
+                 (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth')))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
 
 @socketio.on('authenticate')
 def handle_auth(data):
@@ -124,7 +180,7 @@ def handle_location(data):
         else:
             diff_minutes = (now - prev['last_moved']).total_seconds() / 60
             if diff_minutes > 30 and not prev.get('alert_sent'):
-                alert_msg = f"الموظف {user['name']} متوقف في نفس المكان منذ أكثر من 30 دقيقة!"
+                alert_msg = f"الموظف {user['name']} متوقف منذ أكثر من 30 دقيقة!"
                 socketio.emit('idle_alert', {'user_id': user_id, 'message': alert_msg}, room='admins')
                 employee_tracking[user_id]['alert_sent'] = True
     else:
@@ -158,7 +214,7 @@ def create_user():
                     (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, zone_id, team_id))
         conn.commit()
     except sqlite3.IntegrityError:
-        conn.close(); return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مسجل مسبقاً'}), 409
+        conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
     conn.close(); return jsonify({'success': True})
 
 @app.route('/api/users/managers', methods=['GET'])
@@ -210,6 +266,9 @@ def create_task():
     
     socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{data['assigned_to']}")
     socketio.emit('task_updated', {}, room='admins')
+    
+    # إرسال إشعار خلفية (Web Push)
+    send_web_push(data['assigned_to'], msg_title, msg_body)
     return jsonify({'success': True})
 
 @app.route('/api/tasks/my', methods=['GET'])
@@ -225,7 +284,6 @@ def update_task_status(task_id):
     task = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
     if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
     
-    # معالجة الصور المتعددة وتخزينها كمصفوفة JSON
     existing_images = []
     if task['image_url']:
         try:
@@ -255,7 +313,6 @@ def update_task_status(task_id):
     
     conn.execute(query, params)
     
-    # تنبيه الإدارة بأي تغيير يجريه الموظف (بدء، إكمال، أو تحديث خطوة)
     new_status = data.get('status')
     if (new_status and new_status != task['status']) or data.get('checklist'):
         emp_name = conn.execute('SELECT name FROM users WHERE id = ?', (task['assigned_to'],)).fetchone()['name']
@@ -264,6 +321,9 @@ def update_task_status(task_id):
         msg_body = f"الموظف ({emp_name}) {action} مهمة: {task['title']}"
         conn.execute('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', (task['created_by'], msg_title, msg_body))
         socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{task['created_by']}")
+        
+        # إرسال إشعار للمدير (Web Push)
+        send_web_push(task['created_by'], msg_title, msg_body)
 
     conn.commit(); conn.close()
     socketio.emit('task_updated', {}, room='admins')
