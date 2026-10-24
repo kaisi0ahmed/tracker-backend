@@ -20,8 +20,8 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # --- إعدادات الاتصال بقاعدة بيانات Hostinger ---
 DB_HOST = 'srv1790.hstgr.io'
 DB_NAME = 'u301100000_tracker'
-DB_USER = 'u301100000_ضع_اسم_المستخدم_هنا' # استبدله باسم المستخدم الذي أنشأته
-DB_PASS = 'ضع_كلمة_المرور_هنا'             # استبدله بكلمة المرور
+DB_USER = 'u301100000_admin1'
+DB_PASS = 'kaisi@0Ahmed'
 
 employee_tracking = {}
 VAPID_PRIVATE_KEY = None
