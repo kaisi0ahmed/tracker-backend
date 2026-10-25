@@ -40,8 +40,7 @@ VAPID_PUBLIC_KEY = None
 def get_db_connection():
     conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, cursorclass=pymysql.cursors.DictCursor, autocommit=True)
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SET time_zone = '+03:00'")
+        with conn.cursor() as cursor: cursor.execute("SET time_zone = '+03:00'")
     except: pass
     return conn
 
@@ -50,23 +49,21 @@ def init_db():
     conn = get_db_connection()
     with conn.cursor() as cursor:
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), phone VARCHAR(50) UNIQUE, email VARCHAR(255), emp_id VARCHAR(50), password_hash VARCHAR(255), role VARCHAR(50), job_title VARCHAR(100), zone_id INT, team_id INT, token VARCHAR(255))''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255), assigned_to INT, created_by INT, lat FLOAT, lng FLOAT, due_date DATETIME, status VARCHAR(50) DEFAULT 'new', notes TEXT, image_url LONGTEXT, checklist TEXT, recurrence VARCHAR(50) DEFAULT 'none')''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255), assigned_to INT, created_by INT, lat FLOAT, lng FLOAT, due_date DATETIME, status VARCHAR(50) DEFAULT 'new', notes TEXT, image_url LONGTEXT, checklist TEXT, recurrence VARCHAR(50) DEFAULT 'none', client_id INT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, title VARCHAR(255) NOT NULL, message TEXT, is_read TINYINT(1) DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS teams (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), manager_id INT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS zones (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), coordinates_json TEXT, color VARCHAR(50))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS location_logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, lat FLOAT, lng FLOAT, is_offline_sync TINYINT(1) DEFAULT 0, recorded_at DATETIME)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key_name VARCHAR(100) PRIMARY KEY, value TEXT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions (user_id INT, endpoint TEXT, p256dh TEXT, auth TEXT, UNIQUE(user_id, endpoint(255)))''')
-        
-        # جدول العملاء الجديد (CRM)
         cursor.execute('''CREATE TABLE IF NOT EXISTS clients (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), phone VARCHAR(50), address TEXT, lat FLOAT, lng FLOAT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        
+        # وحدة الإدارة المالية (Expense Management) بفصل العملات
+        cursor.execute('''CREATE TABLE IF NOT EXISTS expenses (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, amount DECIMAL(15,2) NOT NULL, currency VARCHAR(10) NOT NULL, category VARCHAR(100), description TEXT, receipt_url LONGTEXT, status VARCHAR(50) DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         
         try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
         except: pass
         try: cursor.execute("ALTER TABLE tasks ADD COLUMN is_alerted TINYINT(1) DEFAULT 0")
-        except: pass
-        # ربط المهام بالعملاء
-        try: cursor.execute("ALTER TABLE tasks ADD COLUMN client_id INT")
         except: pass
         
         cursor.execute('SELECT * FROM users WHERE role = "admin"')
@@ -180,8 +177,7 @@ def subscribe():
     data = request.get_json()
     endpoint = data.get('endpoint'); keys = data.get('keys', {})
     conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('''INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE p256dh=%s, auth=%s''', (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth'), keys.get('p256dh'), keys.get('auth')))
+    with conn.cursor() as cursor: cursor.execute('''INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE p256dh=%s, auth=%s''', (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth'), keys.get('p256dh'), keys.get('auth')))
     conn.close(); return jsonify({'success': True})
 
 @socketio.on('authenticate')
@@ -204,8 +200,7 @@ def process_incoming_location(user, lat, lng, recorded_at_db=None, is_offline=0)
         baghdad_now = datetime.utcnow() + timedelta(hours=3)
         recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
         recorded_at_display = baghdad_now.strftime('%Y-%m-%d %I:%M %p')
-    else:
-        recorded_at_display = recorded_at_db
+    else: recorded_at_display = recorded_at_db
     
     conn = get_db_connection()
     with conn.cursor() as cursor:
@@ -232,8 +227,7 @@ def handle_location(data):
         cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
         user = cursor.fetchone()
     conn.close()
-    if user and user['role'] == 'employee':
-        process_incoming_location(user, data.get('lat'), data.get('lng'))
+    if user and user['role'] == 'employee': process_incoming_location(user, data.get('lat'), data.get('lng'))
 
 @app.route('/api/location', methods=['POST'])
 def api_fallback_location():
@@ -241,7 +235,6 @@ def api_fallback_location():
     token = request.headers.get('Authorization')
     if token: token = token.replace('Bearer ', '')
     else: token = data.get('token')
-    
     conn = get_db_connection()
     with conn.cursor() as cursor:
         cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
@@ -263,8 +256,7 @@ def sync_locations():
         if not user or user['role'] != 'employee': return jsonify({'error': 'Unauthorized'}), 401
         
         logs = data.get('logs', [])
-        for log in logs:
-            cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user['id'], log['lat'], log['lng'], 1, log['recorded_at']))
+        for log in logs: cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user['id'], log['lat'], log['lng'], 1, log['recorded_at']))
     conn.close()
     socketio.emit('admin_notification', {'title': 'تحديث مسار متأخر', 'message': f'تمت مزامنة مسار أوفلاين للموظف {user["name"]}'}, room='admins')
     return jsonify({'success': True})
@@ -299,8 +291,7 @@ def sync_tasks():
             new_note = upd.get('notes', "")
             combined_notes = f"{existing_notes}\n[مزامنة أوفلاين]: {new_note}".strip() if new_note and existing_notes else new_note or existing_notes
 
-            query = 'UPDATE tasks SET status = %s'
-            params = [upd.get('status', task['status'])]
+            query = 'UPDATE tasks SET status = %s'; params = [upd.get('status', task['status'])]
             if combined_notes: query += ', notes = %s'; params.append(combined_notes)
             if final_image_json is not None: query += ', image_url = %s'; params.append(final_image_json)
             if upd.get('checklist') is not None: query += ', checklist = %s'; params.append(upd.get('checklist'))
@@ -315,7 +306,58 @@ def sync_tasks():
     socketio.emit('task_updated', {}, room='admins')
     return jsonify({'success': True})
 
-# ----------------- وحدات العملاء (CRM) الجديدة -----------------
+# ----------------- الإدارة المالية المستقلة -----------------
+@app.route('/api/expenses', methods=['GET', 'POST'])
+def handle_expenses():
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        if request.method == 'POST':
+            if request.current_user['role'] != 'employee': return jsonify({'error': 'Forbidden'}), 403
+            data = request.get_json()
+            cursor.execute('INSERT INTO expenses (user_id, amount, currency, category, description, receipt_url) VALUES (%s, %s, %s, %s, %s, %s)', 
+                           (request.current_user['id'], data['amount'], data['currency'], data['category'], data.get('description', ''), data.get('receipt_url')))
+            
+            # إرسال إشعار فوري للمدير
+            msg_title = 'مطالبة مالية جديدة 💰'
+            msg_body = f"الموظف {request.current_user['name']} قدم مطالبة بقيمة {data['amount']} {data['currency']}"
+            cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES ((SELECT id FROM users WHERE role="admin" LIMIT 1), %s, %s)', (msg_title, msg_body))
+            socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room='admins')
+            
+            conn.close(); return jsonify({'success': True})
+        else:
+            # عرض مصاريف الموظف نفسه
+            cursor.execute("SELECT * FROM expenses WHERE user_id = %s ORDER BY created_at DESC", (request.current_user['id'],))
+            expenses = cursor.fetchall()
+            conn.close(); return jsonify({'success': True, 'expenses': expenses})
+
+@app.route('/api/expenses/all', methods=['GET'])
+def get_all_expenses():
+    if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT e.*, u.name as emp_name FROM expenses e JOIN users u ON e.user_id = u.id ORDER BY e.created_at DESC")
+        expenses = cursor.fetchall()
+    conn.close(); return jsonify({'success': True, 'expenses': expenses})
+
+@app.route('/api/expenses/<int:expense_id>/status', methods=['PUT'])
+def update_expense_status(expense_id):
+    if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    new_status = data.get('status')
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute('UPDATE expenses SET status = %s WHERE id = %s', (new_status, expense_id))
+        cursor.execute('SELECT user_id, amount, currency FROM expenses WHERE id = %s', (expense_id,))
+        exp = cursor.fetchone()
+        
+        status_ar = "الموافقة على" if new_status == 'approved' else "رفض"
+        msg_title = 'تحديث حالة المطالبة 💳'
+        msg_body = f"تم {status_ar} مطالبتك بقيمة {exp['amount']} {exp['currency']}"
+        cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (exp['user_id'], msg_title, msg_body))
+        socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{exp['user_id']}")
+    conn.close(); return jsonify({'success': True})
+# -------------------------------------------------------------
+
 @app.route('/api/clients', methods=['GET', 'POST'])
 def handle_clients():
     conn = get_db_connection()
@@ -323,12 +365,10 @@ def handle_clients():
         if request.method == 'POST':
             if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
             data = request.get_json()
-            cursor.execute('INSERT INTO clients (name, phone, address, lat, lng) VALUES (%s, %s, %s, %s, %s)', 
-                           (data.get('name'), data.get('phone'), data.get('address'), data.get('lat'), data.get('lng')))
+            cursor.execute('INSERT INTO clients (name, phone, address, lat, lng) VALUES (%s, %s, %s, %s, %s)', (data.get('name'), data.get('phone'), data.get('address'), data.get('lat'), data.get('lng')))
             conn.close(); return jsonify({'success': True})
         else:
-            cursor.execute('SELECT * FROM clients ORDER BY created_at DESC')
-            clients = cursor.fetchall()
+            cursor.execute('SELECT * FROM clients ORDER BY created_at DESC'); clients = cursor.fetchall()
             conn.close(); return jsonify({'success': True, 'clients': clients})
 
 @app.route('/api/clients/<int:client_id>/history', methods=['GET'])
@@ -338,12 +378,10 @@ def client_history(client_id):
         cursor.execute("SELECT t.title, t.status, t.due_date, t.notes, u.name as emp_name FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id WHERE t.client_id = %s ORDER BY t.due_date DESC", (client_id,))
         history = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'history': history})
-# ---------------------------------------------------------------
 
 @app.route('/api/profile/image', methods=['PUT'])
 def update_profile_image():
-    data = request.get_json()
-    conn = get_db_connection()
+    data = request.get_json(); conn = get_db_connection()
     with conn.cursor() as cursor: cursor.execute('UPDATE users SET profile_image = %s WHERE id = %s', (data.get('image_url'), request.current_user['id']))
     conn.close(); return jsonify({'success': True})
 
@@ -405,7 +443,6 @@ def get_stats():
 def get_all_tasks():
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        # ربط جدول المهام مع جدول العملاء لجلب بيانات العميل
         base_query = "SELECT t.*, u.name as assignee_name, c.name as client_name, c.phone as client_phone FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN clients c ON t.client_id = c.id"
         if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.due_date DESC")
         else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.due_date DESC", (request.current_user['id'],))
@@ -416,20 +453,14 @@ def get_all_tasks():
 def create_task():
     data = request.get_json()
     checklist_json = json.dumps([{"title": item, "is_completed": False, "note": ""} for item in data.get('checklist', [])], ensure_ascii=False) if data.get('checklist') else None
-    
-    # التحقق من وجود client_id وسحب إحداثيات العميل إن وجدت
-    client_id = data.get('client_id')
-    lat = data.get('lat'); lng = data.get('lng')
-    
+    client_id = data.get('client_id'); lat = data.get('lat'); lng = data.get('lng')
     conn = get_db_connection()
     with conn.cursor() as cursor:
         if client_id:
             cursor.execute('SELECT lat, lng FROM clients WHERE id = %s', (client_id,))
             client = cursor.fetchone()
             if client and not lat: lat = client['lat']; lng = client['lng']
-            
-        cursor.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence, client_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)', 
-                       (data['title'], data['assigned_to'], request.current_user['id'], lat, lng, data['due_date'], checklist_json, data.get('recurrence', 'none'), client_id))
+        cursor.execute('INSERT INTO tasks (title, assigned_to, created_by, lat, lng, due_date, checklist, recurrence, client_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)', (data['title'], data['assigned_to'], request.current_user['id'], lat, lng, data['due_date'], checklist_json, data.get('recurrence', 'none'), client_id))
         msg_title = 'مهمة جديدة 🚀'; msg_body = f"تم إسناد مهمة جديدة لك: {data['title']}"
         cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (data['assigned_to'], msg_title, msg_body))
     conn.close()
@@ -441,9 +472,7 @@ def create_task():
 @app.route('/api/tasks/my', methods=['GET'])
 def get_my_tasks():
     conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT t.*, c.name as client_name, c.phone as client_phone, c.address as client_address FROM tasks t LEFT JOIN clients c ON t.client_id = c.id WHERE t.assigned_to = %s ORDER BY t.due_date ASC', (request.current_user['id'],))
-        tasks = cursor.fetchall()
+    with conn.cursor() as cursor: cursor.execute('SELECT t.*, c.name as client_name, c.phone as client_phone, c.address as client_address FROM tasks t LEFT JOIN clients c ON t.client_id = c.id WHERE t.assigned_to = %s ORDER BY t.due_date ASC', (request.current_user['id'],)); tasks = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'tasks': tasks})
 
 @app.route('/api/tasks/<int:task_id>/status', methods=['PUT'])
@@ -453,9 +482,7 @@ def update_task_status(task_id):
     with conn.cursor() as cursor:
         cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
         task = cursor.fetchone()
-        if not task: 
-            conn.close()
-            return jsonify({'error': 'Not found'}), 404
+        if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
         
         existing_images = []
         if task['image_url']:
@@ -470,8 +497,7 @@ def update_task_status(task_id):
         new_note = data.get('notes', "")
         combined_notes = f"{existing_notes}\n[تحديث]: {new_note}".strip() if new_note and existing_notes else new_note or existing_notes
 
-        query = 'UPDATE tasks SET status = %s'
-        params = [data.get('status', task['status'])]
+        query = 'UPDATE tasks SET status = %s'; params = [data.get('status', task['status'])]
         if combined_notes: query += ', notes = %s'; params.append(combined_notes)
         if final_image_json is not None: query += ', image_url = %s'; params.append(final_image_json)
         if data.get('checklist') is not None: query += ', checklist = %s'; params.append(data.get('checklist'))
@@ -507,19 +533,6 @@ def get_location_history(user_id):
         cursor.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = %s AND DATE(recorded_at) = %s ORDER BY recorded_at ASC', (user_id, target_date))
         history = cursor.fetchall()
     conn.close(); return jsonify({'success': True, 'history': history})
-
-@app.route('/api/reports', methods=['GET'])
-def get_reports():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        base_query = "SELECT u.name as emp_name, u.job_title, t_team.name as team_name, COUNT(t.id) as total_tasks, SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) as completed_tasks, SUM(CASE WHEN t.status = 'delayed' THEN 1 ELSE 0 END) as delayed_tasks, SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks FROM users u LEFT JOIN tasks t ON u.id = t.assigned_to LEFT JOIN teams t_team ON u.team_id = t_team.id WHERE u.role = 'employee'"
-        if request.current_user['role'] == 'admin': cursor.execute(base_query + ' GROUP BY u.id')
-        else: cursor.execute(base_query + ' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) GROUP BY u.id', (request.current_user['id'],))
-        reports = cursor.fetchall()
-    conn.close()
-    for r in reports:
-        for k in ['total_tasks', 'completed_tasks', 'delayed_tasks', 'in_progress_tasks']: r[k] = int(r[k]) if r[k] else 0
-    return jsonify({'success': True, 'reports': reports})
 
 @app.route('/api/zones', methods=['GET', 'POST'])
 def handle_zones():
