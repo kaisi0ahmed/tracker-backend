@@ -36,7 +36,6 @@ VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
 def get_db_connection():
-    # تم إزالة إعدادات SSL غير المتوافقة التي تسبب رفض الاتصال من قبل الاستضافة
     conn = pymysql.connect(
         host=DB_HOST, 
         user=DB_USER, 
@@ -74,15 +73,20 @@ def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
+            # تحديثات الهيكلة الآلية (Migrations) لإصلاح نقص الأعمدة
             try: cursor.execute("ALTER TABLE tasks ADD COLUMN scheduled_start DATETIME")
             except: pass
             try: cursor.execute("ALTER TABLE tasks ADD COLUMN duration_hours FLOAT DEFAULT 2.0")
             except: pass
+            try: cursor.execute("ALTER TABLE users ADD COLUMN status VARCHAR(50) DEFAULT 'active'")
+            except: pass
+            try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
+            except: pass
             
             cursor.execute('SELECT * FROM users WHERE role = "admin"')
             if not cursor.fetchone():
-                cursor.execute('INSERT INTO users (name, phone, email, emp_id, password_hash, role) VALUES (%s, %s, %s, %s, %s, %s)', 
-                               ('مدير النظام', '07000000000', 'admin@domain.com', 'A001', generate_password_hash('admin123'), 'admin'))
+                cursor.execute('INSERT INTO users (name, phone, email, emp_id, password_hash, role, status) VALUES (%s, %s, %s, %s, %s, %s, %s)', 
+                               ('مدير النظام', '07000000000', 'admin@domain.com', 'A001', generate_password_hash('admin123'), 'admin', 'active'))
             
             cursor.execute('SELECT value FROM settings WHERE key_name="vapid_private"')
             vapid = cursor.fetchone()
@@ -153,6 +157,8 @@ def login():
             cursor.execute('SELECT * FROM users WHERE phone = %s', (data.get('phone'),))
             user = cursor.fetchone()
             if user and check_password_hash(user['password_hash'], data.get('password')):
+                if user.get('status') != 'active':
+                    return jsonify({'error': 'Forbidden', 'message': 'حسابك غير فعال حالياً'}), 403
                 token = secrets.token_hex(32)
                 cursor.execute('UPDATE users SET token = %s WHERE id = %s', (token, user['id']))
                 log_action(cursor, user['id'], 'login', 'users', user['id'], "تسجيل دخول للنظام")
@@ -214,7 +220,7 @@ def process_incoming_location(user, lat, lng, recorded_at_db=None, is_offline=0)
         conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, is_offline, recorded_at_db))
-            if user['zone_id']:
+            if user.get('zone_id'):
                 cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
                 zone = cursor.fetchone()
                 if zone and zone['coordinates_json']:
@@ -226,9 +232,9 @@ def process_incoming_location(user, lat, lng, recorded_at_db=None, is_offline=0)
     finally:
         if conn: conn.close()
     
-    loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_db }
+    loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user.get('zone_id'), 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_db }
     socketio.emit('new_location', loc_data, room='admins')
-    if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
+    if user.get('team_id'): socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
 
 @socketio.on('send_location')
 def handle_location(data):
@@ -354,9 +360,9 @@ def get_employees():
         conn = get_db_connection()
         with conn.cursor() as cursor:
             if request.current_user['role'] == 'admin': 
-                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager') AND u.status='active'")
+                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, u.status, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager')")
             else: 
-                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND u.status='active'", (request.current_user['id'],))
+                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, u.status, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
             employees = cursor.fetchall()
         return jsonify({'success': True, 'employees': employees})
     except Exception as e:
@@ -364,7 +370,6 @@ def get_employees():
     finally:
         if conn: conn.close()
 
-# تمت إضافة معالجة التعديل (PUT) لضمان توافق الواجهة
 @app.route('/api/users', methods=['POST'])
 @app.route('/api/users/<int:user_id>', methods=['PUT', 'DELETE'])
 def manage_users(user_id=None):
@@ -381,8 +386,8 @@ def manage_users(user_id=None):
                 raw_team = data.get('team_id')
                 team_id = int(raw_team) if raw_team not in [None, '', 'null'] else None
                 
-                cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s)', 
-                               (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id))
+                cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', 
+                               (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id, 'active'))
                 log_action(cursor, request.current_user['id'], 'create_user', 'users', cursor.lastrowid, f"إضافة مستخدم جديد: {data.get('name')}")
                 return jsonify({'success': True})
                 
