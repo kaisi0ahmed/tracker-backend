@@ -36,6 +36,7 @@ VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
 def get_db_connection():
+    # تم إزالة إعدادات SSL غير المتوافقة التي تسبب رفض الاتصال من قبل الاستضافة
     conn = pymysql.connect(
         host=DB_HOST, 
         user=DB_USER, 
@@ -44,9 +45,7 @@ def get_db_connection():
         charset='utf8mb4',
         cursorclass=pymysql.cursors.DictCursor, 
         autocommit=True,
-        connect_timeout=10,
-        ssl={"fake_flag_to_enable_tls": True},
-        client_flag=pymysql.constants.CLIENT.SSL
+        connect_timeout=10
     )
     try:
         with conn.cursor() as cursor: 
@@ -365,22 +364,47 @@ def get_employees():
     finally:
         if conn: conn.close()
 
+# تمت إضافة معالجة التعديل (PUT) لضمان توافق الواجهة
 @app.route('/api/users', methods=['POST'])
-def create_user():
+@app.route('/api/users/<int:user_id>', methods=['PUT', 'DELETE'])
+def manage_users(user_id=None):
     if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-    data = request.get_json()
-    hashed_password = generate_password_hash(data.get('password'))
-    emp_id = f"E{int(datetime.utcnow().timestamp())}"
-    team_id = int(data.get('team_id')) if data.get('team_id') else None
+    data = request.get_json() if request.method in ['POST', 'PUT'] else {}
     
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s)', 
-                           (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id))
-            log_action(cursor, request.current_user['id'], 'create_user', 'users', cursor.lastrowid, f"إضافة مستخدم جديد: {data.get('name')}")
-        return jsonify({'success': True})
+            if request.method == 'POST':
+                hashed_password = generate_password_hash(data.get('password'))
+                emp_id = f"E{int(datetime.utcnow().timestamp())}"
+                raw_team = data.get('team_id')
+                team_id = int(raw_team) if raw_team not in [None, '', 'null'] else None
+                
+                cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s)', 
+                               (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id))
+                log_action(cursor, request.current_user['id'], 'create_user', 'users', cursor.lastrowid, f"إضافة مستخدم جديد: {data.get('name')}")
+                return jsonify({'success': True})
+                
+            elif request.method == 'PUT':
+                raw_team = data.get('team_id')
+                team_id = int(raw_team) if raw_team not in [None, '', 'null'] else None
+                
+                if data.get('password'):
+                    hashed_password = generate_password_hash(data.get('password'))
+                    cursor.execute('UPDATE users SET name=%s, phone=%s, password_hash=%s, role=%s, job_title=%s, team_id=%s WHERE id=%s',
+                                   (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), team_id, user_id))
+                else:
+                    cursor.execute('UPDATE users SET name=%s, phone=%s, role=%s, job_title=%s, team_id=%s WHERE id=%s',
+                                   (data.get('name'), data.get('phone'), data.get('role', 'employee'), data.get('job_title', 'موظف'), team_id, user_id))
+                log_action(cursor, request.current_user['id'], 'edit_user', 'users', user_id, f"تعديل بيانات المستخدم: {data.get('name')}")
+                return jsonify({'success': True})
+                
+            elif request.method == 'DELETE':
+                cursor.execute('UPDATE users SET status = "inactive" WHERE id = %s', (user_id,))
+                log_action(cursor, request.current_user['id'], 'delete_user', 'users', user_id, "إيقاف مستخدم")
+                return jsonify({'success': True})
+                
     except pymysql.err.IntegrityError: 
         return jsonify({'error': 'Conflict', 'message': 'رقم الهاتف مسجل مسبقاً، يرجى اختيار رقم آخر'}), 409
     except Exception as e:
