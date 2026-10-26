@@ -73,13 +73,37 @@ def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
+            # 🌟 نظام التحديث الهيكلي الشامل الذكي (Auto-Migration) 🌟
+            # إضافة أي أعمدة قد تكون ناقصة في الجداول لمنع انهيار الـ Backend
+            
+            # جدول المهام (Tasks)
             try: cursor.execute("ALTER TABLE tasks ADD COLUMN scheduled_start DATETIME")
             except: pass
             try: cursor.execute("ALTER TABLE tasks ADD COLUMN duration_hours FLOAT DEFAULT 2.0")
             except: pass
+            try: cursor.execute("ALTER TABLE tasks ADD COLUMN description TEXT")
+            except: pass
+            try: cursor.execute("ALTER TABLE tasks ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            try: cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at DATETIME")
+            except: pass
+            
+            # جدول المستخدمين (Users)
             try: cursor.execute("ALTER TABLE users ADD COLUMN status VARCHAR(50) DEFAULT 'active'")
             except: pass
             try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
+            except: pass
+            
+            # جدول العملاء (Clients)
+            try: cursor.execute("ALTER TABLE clients ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+
+            # جدول أوامر العمل (Work Orders)
+            try: cursor.execute("ALTER TABLE work_orders ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            
+            # جدول الفرق (Teams)
+            try: cursor.execute("ALTER TABLE teams ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
             
             cursor.execute('SELECT * FROM users WHERE role = "admin"')
@@ -102,7 +126,7 @@ def init_db():
                 VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(pub_bytes).decode('utf-8').rstrip('=')
                 cursor.execute('INSERT INTO settings (key_name, value) VALUES (%s, %s)', ('vapid_private', VAPID_PRIVATE_KEY))
                 cursor.execute('INSERT INTO settings (key_name, value) VALUES (%s, %s)', ('vapid_public', VAPID_PUBLIC_KEY))
-        print("✅ Database initialized successfully.")
+        print("✅ Database initialized and migrated successfully.")
     except Exception as e:
         print(f"❌ Database INIT failed: {e}")
     finally:
@@ -342,10 +366,10 @@ def get_all_tasks():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # تم إصلاح الخطأ u.status و t.created_at في الـ ORDER BY
+            # 🌟 تصحيح عمود الوصف وإرجاع الحقول بشكل آمن
             base_query = '''SELECT t.id, t.title, t.description, t.assigned_to, t.created_by, t.lat, t.lng, t.address, t.scheduled_start, t.duration_hours, t.due_date, t.priority, t.status, t.notes, t.image_url, t.checklist, t.recurrence, t.client_id, t.work_order_id, t.form_id, t.is_alerted, t.created_at, t.completed_at, u.name as assignee_name, u.team_id, c.name as client_name, c.phone as client_phone FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN clients c ON t.client_id = c.id'''
-            if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.due_date DESC")
-            else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.due_date DESC", (request.current_user['id'],))
+            if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.id DESC")
+            else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.id DESC", (request.current_user['id'],))
             tasks = cursor.fetchall()
         return jsonify({'success': True, 'tasks': tasks})
     except Exception as e:
@@ -432,8 +456,8 @@ def handle_teams():
                 log_action(cursor, request.current_user['id'], 'create_team', 'teams', team_id, f"إنشاء فريق: {data.get('name')}")
                 return jsonify({'success': True, 'id': team_id})
             else:
-                # تم إصلاح الخطأ u.status و t.created_at في الـ ORDER BY
-                cursor.execute('''SELECT t.id, t.name, t.manager_id, t.created_at, u.name as manager_name, (SELECT COUNT(*) FROM users WHERE team_id = t.id) as members_count FROM teams t LEFT JOIN users u ON t.manager_id = u.id ORDER BY t.created_at DESC''')
+                # 🌟 تصحيح جلب الفرق
+                cursor.execute('''SELECT t.id, t.name, t.manager_id, t.created_at, u.name as manager_name, (SELECT COUNT(*) FROM users WHERE team_id = t.id) as members_count FROM teams t LEFT JOIN users u ON t.manager_id = u.id ORDER BY t.id DESC''')
                 teams = cursor.fetchall()
                 return jsonify({'success': True, 'teams': teams})
     except Exception as e:
@@ -455,8 +479,8 @@ def handle_work_orders():
                 log_action(cursor, request.current_user['id'], 'create_work_order', 'work_orders', wo_id, f"أمر عمل: {data.get('title')}")
                 return jsonify({'success': True, 'id': wo_id})
             else:
-                # تم إصلاح الخطأ u.status و w.created_at في الـ ORDER BY
-                cursor.execute('''SELECT w.id, w.title, w.client_id, w.team_id, w.status, w.created_at, c.name as client_name, t.name as team_name, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id) as total_tasks, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id AND status = 'completed') as completed_tasks FROM work_orders w LEFT JOIN clients c ON w.client_id = c.id LEFT JOIN teams t ON w.team_id = t.id ORDER BY w.created_at DESC''')
+                # 🌟 تصحيح جلب أوامر العمل
+                cursor.execute('''SELECT w.id, w.title, w.client_id, w.team_id, w.status, w.created_at, c.name as client_name, t.name as team_name, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id) as total_tasks, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id AND status = 'completed') as completed_tasks FROM work_orders w LEFT JOIN clients c ON w.client_id = c.id LEFT JOIN teams t ON w.team_id = t.id ORDER BY w.id DESC''')
                 wos = cursor.fetchall()
                 return jsonify({'success': True, 'work_orders': wos})
     except Exception as e:
@@ -508,7 +532,7 @@ def handle_clients():
                 log_action(cursor, request.current_user['id'], 'create_client', 'clients', cursor.lastrowid, f"عميل جديد: {data.get('name')}")
                 return jsonify({'success': True})
             else:
-                cursor.execute('SELECT id, name, phone, address, lat, lng, created_at FROM clients ORDER BY created_at DESC')
+                cursor.execute('SELECT id, name, phone, address, lat, lng, created_at FROM clients ORDER BY id DESC')
                 clients = cursor.fetchall()
                 return jsonify({'success': True, 'clients': clients})
     except Exception as e:
@@ -530,7 +554,7 @@ def handle_forms():
                 log_action(cursor, request.current_user['id'], 'create_form', 'forms', form_id, f"نموذج جديد: {data.get('title')}")
                 return jsonify({'success': True, 'id': form_id})
             else:
-                cursor.execute('SELECT * FROM forms ORDER BY created_at DESC')
+                cursor.execute('SELECT * FROM forms ORDER BY id DESC')
                 forms = cursor.fetchall()
                 return jsonify({'success': True, 'forms': forms})
     except Exception as e:
