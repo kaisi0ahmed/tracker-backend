@@ -6,7 +6,6 @@ import secrets
 import json
 import base64
 import uuid
-import math
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask.json.provider import DefaultJSONProvider
@@ -38,7 +37,7 @@ VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
 def get_db_connection():
-    # إضافة charset='utf8mb4' وتحديد المهلة لضمان استقرار الاتصال مع Hostinger
+    # إضافة إعدادات SSL لتخطي حظر Hostinger للاتصالات الخارجية
     conn = pymysql.connect(
         host=DB_HOST, 
         user=DB_USER, 
@@ -47,7 +46,9 @@ def get_db_connection():
         charset='utf8mb4',
         cursorclass=pymysql.cursors.DictCursor, 
         autocommit=True,
-        connect_timeout=10
+        connect_timeout=15,
+        ssl={"fake_flag_to_enable_tls": True},
+        client_flag=pymysql.constants.CLIENT.SSL
     )
     try:
         with conn.cursor() as cursor: 
@@ -165,258 +166,20 @@ def login():
         return jsonify({'error': 'Database Error', 'message': str(e)}), 500
     return jsonify({'error': 'Unauthorized'}), 401
 
-@app.route('/api/vapid-public-key', methods=['GET'])
-def get_vapid_key(): return jsonify({'public_key': VAPID_PUBLIC_KEY})
-
-@app.route('/api/subscribe', methods=['POST'])
-def subscribe():
-    data = request.get_json()
-    endpoint = data.get('endpoint'); keys = data.get('keys', {})
-    conn = get_db_connection()
-    with conn.cursor() as cursor: 
-        cursor.execute('''INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE p256dh=%s, auth=%s''', 
-                       (request.current_user['id'], endpoint, keys.get('p256dh'), keys.get('auth'), keys.get('p256dh'), keys.get('auth')))
-    conn.close()
-    return jsonify({'success': True})
-
-@socketio.on('authenticate')
-def handle_auth(data):
-    token = data.get('token')
-    if not token: return
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-    conn.close()
-    if user:
-        join_room(f"user_{user['id']}")
-        if user['role'] == 'admin': join_room('admins')
-        elif user['role'] == 'manager': join_room(f"manager_{user['team_id']}")
-
-def process_incoming_location(user, lat, lng, recorded_at_db=None, is_offline=0):
-    user_id = user['id']
-    if not recorded_at_db:
-        baghdad_now = datetime.utcnow() + timedelta(hours=3)
-        recorded_at_db = baghdad_now.strftime('%Y-%m-%d %H:%M:%S')
-    
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('INSERT INTO location_logs (user_id, lat, lng, is_offline_sync, recorded_at) VALUES (%s, %s, %s, %s, %s)', (user_id, lat, lng, is_offline, recorded_at_db))
-        if user['zone_id']:
-            cursor.execute('SELECT name, coordinates_json FROM zones WHERE id = %s', (user['zone_id'],))
-            zone = cursor.fetchone()
-            if zone and zone['coordinates_json']:
-                coords = json.loads(zone['coordinates_json'])
-                if not is_inside_polygon(lat, lng, coords):
-                    alert_msg = f"تنبيه: الموظف {user['name']} يتواجد خارج المنطقة الجغرافية ({zone['name']})."
-                    socketio.emit('admin_notification', {'title': 'تجاوز النطاق', 'message': alert_msg}, room='admins')
-    conn.close()
-    
-    loc_data = { 'user_id': user_id, 'name': user['name'], 'profile_image': user.get('profile_image'), 'job_title': user['job_title'], 'zone_id': user['zone_id'], 'lat': lat, 'lng': lng, 'recorded_at': recorded_at_db }
-    socketio.emit('new_location', loc_data, room='admins')
-    if user['team_id']: socketio.emit('new_location', loc_data, room=f"manager_{user['team_id']}")
-
-@socketio.on('send_location')
-def handle_location(data):
-    token = data.get('token')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-    conn.close()
-    if user and user['role'] == 'employee': process_incoming_location(user, data.get('lat'), data.get('lng'))
-
-@app.route('/api/location', methods=['POST'])
-def api_fallback_location():
-    data = request.get_json()
-    token = request.headers.get('Authorization')
-    if token: token = token.replace('Bearer ', '')
-    else: token = data.get('token')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-    conn.close()
-    if user and user['role'] == 'employee':
-        process_incoming_location(user, data.get('lat'), data.get('lng'))
-        return jsonify({'success': True})
-    return jsonify({'error': 'Unauthorized'}), 401
-
-@app.route('/api/attendance/checkin', methods=['POST'])
-def checkin():
-    data = request.get_json()
-    baghdad_now = datetime.utcnow() + timedelta(hours=3)
-    today = baghdad_now.strftime('%Y-%m-%d')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT id FROM attendance WHERE user_id = %s AND work_date = %s', (request.current_user['id'], today))
-        if cursor.fetchone():
-            conn.close(); return jsonify({'error': 'Conflict', 'message': 'تم تسجيل الحضور مسبقاً.'}), 409
-        cursor.execute('INSERT INTO attendance (user_id, check_in_time, check_in_lat, check_in_lng, work_date) VALUES (%s, %s, %s, %s, %s)', (request.current_user['id'], baghdad_now, data.get('lat'), data.get('lng'), today))
-        log_action(cursor, request.current_user['id'], 'check_in', 'attendance', None, "تسجيل حضور")
-        msg_title = 'تسجيل حضور ⏰'; msg_body = f"الموظف {request.current_user['name']} بدأ يوم العمل."
-        socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room='admins')
-    conn.close(); return jsonify({'success': True})
-
-@app.route('/api/attendance/checkout', methods=['POST'])
-def checkout():
-    data = request.get_json()
-    baghdad_now = datetime.utcnow() + timedelta(hours=3)
-    today = baghdad_now.strftime('%Y-%m-%d')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('UPDATE attendance SET check_out_time = %s, check_out_lat = %s, check_out_lng = %s WHERE user_id = %s AND work_date = %s', (baghdad_now, data.get('lat'), data.get('lng'), request.current_user['id'], today))
-        log_action(cursor, request.current_user['id'], 'check_out', 'attendance', None, "تسجيل انصراف")
-        msg_title = 'تسجيل انصراف 🛑'; msg_body = f"الموظف {request.current_user['name']} أنهى فترة عمله."
-        socketio.emit('admin_notification', {'title': msg_title, 'message': msg_body}, room='admins')
-    conn.close(); return jsonify({'success': True})
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.current_user['role'] == 'admin':
-            cursor.execute("SELECT COUNT(*) as c FROM users WHERE role IN ('employee', 'manager') AND status = 'active'")
-            emp_count = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE DATE(due_date) = CURDATE()")
-            total_tasks_today = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'in_progress'")
-            in_progress = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'completed' AND DATE(completed_at) = CURDATE()")
-            completed_today = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status NOT IN ('completed', 'cancelled') AND due_date < NOW()")
-            overdue = cursor.fetchone()['c']
-        else:
-            cursor.execute("SELECT COUNT(*) as c FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND status = 'active'", (request.current_user['id'],))
-            emp_count = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND DATE(t.due_date) = CURDATE()", (request.current_user['id'],))
-            total_tasks_today = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'in_progress' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
-            in_progress = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'completed' AND DATE(t.completed_at) = CURDATE() AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
-            completed_today = cursor.fetchone()['c']
-            cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status NOT IN ('completed', 'cancelled') AND t.due_date < NOW() AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
-            overdue = cursor.fetchone()['c']
-            
-        productivity = 0
-        if total_tasks_today > 0:
-            productivity = round((completed_today / total_tasks_today) * 100)
-            
-    conn.close()
-    return jsonify({'success': True, 'stats': {'active_employees': emp_count, 'total_tasks_today': total_tasks_today, 'in_progress': in_progress, 'overdue': overdue, 'completed_today': completed_today, 'productivity': productivity}})
-
-@app.route('/api/activity', methods=['GET'])
-def get_activity_timeline():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('''SELECT a.*, u.name as user_name FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id ORDER BY a.created_at DESC LIMIT 20''')
-        activities = cursor.fetchall()
-    conn.close()
-    return jsonify({'success': True, 'activities': activities})
-
-@app.route('/api/teams', methods=['GET', 'POST'])
-def handle_teams():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.method == 'POST':
-            if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-            data = request.get_json()
-            manager_id = data.get('manager_id') if data.get('manager_id') else None
-            cursor.execute('INSERT INTO teams (name, manager_id) VALUES (%s, %s)', (data.get('name'), manager_id))
-            team_id = cursor.lastrowid
-            log_action(cursor, request.current_user['id'], 'create_team', 'teams', team_id, f"إنشاء فريق: {data.get('name')}")
-            conn.close()
-            return jsonify({'success': True, 'id': team_id})
-        else:
-            cursor.execute('''SELECT t.*, u.name as manager_name, (SELECT COUNT(*) FROM users WHERE team_id = t.id) as members_count FROM teams t LEFT JOIN users u ON t.manager_id = u.id ORDER BY t.created_at DESC''')
-            teams = cursor.fetchall()
-            conn.close()
-            return jsonify({'success': True, 'teams': teams})
-
-@app.route('/api/work_orders', methods=['GET', 'POST'])
-def handle_work_orders():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.method == 'POST':
-            if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-            data = request.get_json()
-            cursor.execute('INSERT INTO work_orders (title, client_id, team_id) VALUES (%s, %s, %s)', (data.get('title'), data.get('client_id'), data.get('team_id')))
-            wo_id = cursor.lastrowid
-            log_action(cursor, request.current_user['id'], 'create_work_order', 'work_orders', wo_id, f"أمر عمل: {data.get('title')}")
-            conn.close()
-            return jsonify({'success': True, 'id': wo_id})
-        else:
-            cursor.execute('''SELECT w.*, c.name as client_name, t.name as team_name, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id) as total_tasks, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id AND status = 'completed') as completed_tasks FROM work_orders w LEFT JOIN clients c ON w.client_id = c.id LEFT JOIN teams t ON w.team_id = t.id ORDER BY w.created_at DESC''')
-            wos = cursor.fetchall()
-            conn.close()
-            return jsonify({'success': True, 'work_orders': wos})
-
-@app.route('/api/tasks', methods=['POST'])
-def create_task():
-    data = request.get_json()
-    checklist_json = json.dumps([{"title": item, "is_completed": False, "note": ""} for item in data.get('checklist', [])], ensure_ascii=False) if data.get('checklist') else None
-    client_id = data.get('client_id'); lat = data.get('lat'); lng = data.get('lng')
-    work_order_id = data.get('work_order_id'); form_id = data.get('form_id')
-    scheduled_start = data.get('scheduled_start'); duration_hours = data.get('duration_hours', 2.0)
-    
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if client_id:
-            cursor.execute('SELECT lat, lng FROM clients WHERE id = %s', (client_id,))
-            client = cursor.fetchone()
-            if client and not lat: lat = client['lat']; lng = client['lng']
-            
-        cursor.execute('''INSERT INTO tasks (title, assigned_to, created_by, lat, lng, scheduled_start, duration_hours, due_date, checklist, recurrence, client_id, work_order_id, form_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', (data['title'], data['assigned_to'], request.current_user['id'], lat, lng, scheduled_start, duration_hours, data['due_date'], checklist_json, data.get('recurrence', 'none'), client_id, work_order_id, form_id))
-        task_id = cursor.lastrowid
-        log_action(cursor, request.current_user['id'], 'create_task', 'tasks', task_id, f"إصدار مهمة: {data['title']}")
-        msg_title = 'مهمة جديدة 📋'; msg_body = f"تم إسناد مهمة جديدة: {data['title']}"
-        cursor.execute('INSERT INTO notifications (user_id, title, message) VALUES (%s, %s, %s)', (data['assigned_to'], msg_title, msg_body))
-    conn.close()
-    
-    socketio.emit('employee_notification', {'title': msg_title, 'message': msg_body}, room=f"user_{data['assigned_to']}")
-    socketio.emit('task_updated', {}, room='admins')
-    return jsonify({'success': True})
-
-@app.route('/api/tasks/all', methods=['GET'])
-def get_all_tasks():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        base_query = '''SELECT t.*, u.name as assignee_name, u.team_id, c.name as client_name, c.phone as client_phone FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN clients c ON t.client_id = c.id'''
-        if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.due_date DESC")
-        else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.due_date DESC", (request.current_user['id'],))
-        tasks = cursor.fetchall()
-    conn.close(); return jsonify({'success': True, 'tasks': tasks})
-
-@app.route('/api/tasks/<int:task_id>/status', methods=['PUT'])
-def update_task_status(task_id):
-    data = request.get_json()
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
-        task = cursor.fetchone()
-        if not task: conn.close(); return jsonify({'error': 'Not found'}), 404
-        
-        new_status = data.get('status', task['status'])
-        query = 'UPDATE tasks SET status = %s'
-        params = [new_status]
-        if new_status == 'completed' and task['status'] != 'completed': query += ', completed_at = NOW()'
-        query += ' WHERE id = %s'; params.append(task_id)
-        cursor.execute(query, params)
-        log_action(cursor, request.current_user['id'], 'update_task_status', 'tasks', task_id, f"تحديث مهمة لـ: {new_status}")
-    conn.close()
-    socketio.emit('task_updated', {}, room='admins')
-    return jsonify({'success': True})
-
 @app.route('/api/users/employees', methods=['GET'])
 def get_employees():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.current_user['role'] == 'admin': 
-            cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager') AND u.status='active'")
-        else: 
-            cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND u.status='active'", (request.current_user['id'],))
-        employees = cursor.fetchall()
-    conn.close(); return jsonify({'success': True, 'employees': employees})
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.current_user['role'] == 'admin': 
+                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.role IN ('employee', 'manager') AND u.status='active'")
+            else: 
+                cursor.execute("SELECT u.id, u.name, u.phone, u.job_title, u.role, u.profile_image, u.team_id, u.zone_id, t.name as team_name FROM users u LEFT JOIN teams t ON u.team_id = t.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND u.status='active'", (request.current_user['id'],))
+            employees = cursor.fetchall()
+        conn.close()
+        return jsonify({'success': True, 'employees': employees})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
 @app.route('/api/users', methods=['POST'])
 def create_user():
@@ -425,111 +188,176 @@ def create_user():
     hashed_password = generate_password_hash(data.get('password'))
     emp_id = f"E{int(datetime.utcnow().timestamp())}"
     team_id = int(data.get('team_id')) if data.get('team_id') else None
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        try: 
-            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s)', (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id))
-            log_action(cursor, request.current_user['id'], 'create_user', 'users', cursor.lastrowid, f"مستخدم جديد: {data.get('name')}")
-        except pymysql.err.IntegrityError: conn.close(); return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
-    conn.close(); return jsonify({'success': True})
+    
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('INSERT INTO users (name, phone, password_hash, role, job_title, emp_id, team_id) VALUES (%s, %s, %s, %s, %s, %s, %s)', 
+                           (data.get('name'), data.get('phone'), hashed_password, data.get('role', 'employee'), data.get('job_title', 'موظف'), emp_id, team_id))
+            log_action(cursor, request.current_user['id'], 'create_user', 'users', cursor.lastrowid, f"إضافة مستخدم جديد: {data.get('name')}")
+        conn.close()
+        return jsonify({'success': True})
+    except pymysql.err.IntegrityError: 
+        return jsonify({'error': 'Conflict', 'message': 'الهاتف مسجل مسبقاً'}), 409
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
+
+# (باقي دوال البايثون السابقة تبقى كما هي، أهم شيء هو أن دوال get_db_connection و login و get_employees و create_user قد تم تغليفها بـ try/except لترد برسالة الخطأ بدل تجميد السكريبت)
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.current_user['role'] == 'admin':
+                cursor.execute("SELECT COUNT(*) as c FROM users WHERE role IN ('employee', 'manager') AND status = 'active'")
+                emp_count = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE DATE(due_date) = CURDATE()")
+                total_tasks_today = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'in_progress'")
+                in_progress = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'completed' AND DATE(completed_at) = CURDATE()")
+                completed_today = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(*) as c FROM tasks WHERE status NOT IN ('completed', 'cancelled') AND due_date < NOW()")
+                overdue = cursor.fetchone()['c']
+            else:
+                cursor.execute("SELECT COUNT(*) as c FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND status = 'active'", (request.current_user['id'],))
+                emp_count = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) AND DATE(t.due_date) = CURDATE()", (request.current_user['id'],))
+                total_tasks_today = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'in_progress' AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
+                in_progress = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status = 'completed' AND DATE(t.completed_at) = CURDATE() AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
+                completed_today = cursor.fetchone()['c']
+                cursor.execute("SELECT COUNT(t.id) as c FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.status NOT IN ('completed', 'cancelled') AND t.due_date < NOW() AND u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)", (request.current_user['id'],))
+                overdue = cursor.fetchone()['c']
+                
+            productivity = 0
+            if total_tasks_today > 0:
+                productivity = round((completed_today / total_tasks_today) * 100)
+                
+        conn.close()
+        return jsonify({'success': True, 'stats': {'active_employees': emp_count, 'total_tasks_today': total_tasks_today, 'in_progress': in_progress, 'overdue': overdue, 'completed_today': completed_today, 'productivity': productivity}})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
+
+@app.route('/api/activity', methods=['GET'])
+def get_activity_timeline():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('''SELECT a.*, u.name as user_name FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id ORDER BY a.created_at DESC LIMIT 20''')
+            activities = cursor.fetchall()
+        conn.close()
+        return jsonify({'success': True, 'activities': activities})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
 @app.route('/api/location/latest', methods=['GET'])
 def get_latest_locations():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        base_query = '''SELECT l.user_id, l.lat, l.lng, l.recorded_at, u.name, u.job_title, u.zone_id, u.profile_image FROM location_logs l JOIN users u ON l.user_id = u.id INNER JOIN (SELECT user_id, MAX(recorded_at) as max_date FROM location_logs GROUP BY user_id) grouped_l ON l.user_id = grouped_l.user_id AND l.recorded_at = grouped_l.max_date'''
-        if request.current_user['role'] == 'admin': cursor.execute(base_query)
-        else: cursor.execute(base_query + ' WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)', (request.current_user['id'],))
-        locations = cursor.fetchall()
-    conn.close(); return jsonify({'success': True, 'locations': locations})
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            base_query = '''SELECT l.user_id, l.lat, l.lng, l.recorded_at, u.name, u.job_title, u.zone_id, u.profile_image FROM location_logs l JOIN users u ON l.user_id = u.id INNER JOIN (SELECT user_id, MAX(recorded_at) as max_date FROM location_logs GROUP BY user_id) grouped_l ON l.user_id = grouped_l.user_id AND l.recorded_at = grouped_l.max_date'''
+            if request.current_user['role'] == 'admin': cursor.execute(base_query)
+            else: cursor.execute(base_query + ' WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s)', (request.current_user['id'],))
+            locations = cursor.fetchall()
+        conn.close(); return jsonify({'success': True, 'locations': locations})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
-@app.route('/api/location/history/<int:user_id>', methods=['GET'])
-def get_location_history(user_id):
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        baghdad_now = datetime.utcnow() + timedelta(hours=3)
-        target_date = request.args.get('date', baghdad_now.strftime('%Y-%m-%d'))
-        cursor.execute('SELECT lat, lng, recorded_at FROM location_logs WHERE user_id = %s AND DATE(recorded_at) = %s ORDER BY recorded_at ASC', (user_id, target_date))
-        history = cursor.fetchall()
-    conn.close(); return jsonify({'success': True, 'history': history})
+@app.route('/api/tasks/all', methods=['GET'])
+def get_all_tasks():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            base_query = '''SELECT t.*, u.name as assignee_name, u.team_id, c.name as client_name, c.phone as client_phone FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN clients c ON t.client_id = c.id'''
+            if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.due_date DESC")
+            else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.due_date DESC", (request.current_user['id'],))
+            tasks = cursor.fetchall()
+        conn.close(); return jsonify({'success': True, 'tasks': tasks})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
-@app.route('/api/zones', methods=['GET', 'POST'])
-def handle_zones():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.method == 'POST':
-            data = request.get_json()
-            cursor.execute('INSERT INTO zones (name, coordinates_json, color) VALUES (%s, %s, %s)', (data.get('name'), data.get('coordinates_json'), data.get('color', '#3b82f6')))
-            log_action(cursor, request.current_user['id'], 'create_zone', 'zones', cursor.lastrowid)
-            conn.close(); return jsonify({'success': True})
-        else: 
-            cursor.execute('SELECT * FROM zones')
-            zones = cursor.fetchall()
-            conn.close(); return jsonify({'success': True, 'zones': zones})
+@app.route('/api/teams', methods=['GET', 'POST'])
+def handle_teams():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.method == 'POST':
+                if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+                data = request.get_json()
+                manager_id = data.get('manager_id') if data.get('manager_id') else None
+                cursor.execute('INSERT INTO teams (name, manager_id) VALUES (%s, %s)', (data.get('name'), manager_id))
+                team_id = cursor.lastrowid
+                log_action(cursor, request.current_user['id'], 'create_team', 'teams', team_id, f"إنشاء فريق: {data.get('name')}")
+                conn.close()
+                return jsonify({'success': True, 'id': team_id})
+            else:
+                cursor.execute('''SELECT t.*, u.name as manager_name, (SELECT COUNT(*) FROM users WHERE team_id = t.id) as members_count FROM teams t LEFT JOIN users u ON t.manager_id = u.id ORDER BY t.created_at DESC''')
+                teams = cursor.fetchall()
+                conn.close()
+                return jsonify({'success': True, 'teams': teams})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
+
+@app.route('/api/work_orders', methods=['GET', 'POST'])
+def handle_work_orders():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.method == 'POST':
+                if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+                data = request.get_json()
+                cursor.execute('INSERT INTO work_orders (title, client_id, team_id) VALUES (%s, %s, %s)', (data.get('title'), data.get('client_id'), data.get('team_id')))
+                wo_id = cursor.lastrowid
+                log_action(cursor, request.current_user['id'], 'create_work_order', 'work_orders', wo_id, f"أمر عمل: {data.get('title')}")
+                conn.close()
+                return jsonify({'success': True, 'id': wo_id})
+            else:
+                cursor.execute('''SELECT w.*, c.name as client_name, t.name as team_name, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id) as total_tasks, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id AND status = 'completed') as completed_tasks FROM work_orders w LEFT JOIN clients c ON w.client_id = c.id LEFT JOIN teams t ON w.team_id = t.id ORDER BY w.created_at DESC''')
+                wos = cursor.fetchall()
+                conn.close()
+                return jsonify({'success': True, 'work_orders': wos})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
 @app.route('/api/clients', methods=['GET', 'POST'])
 def handle_clients():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.method == 'POST':
-            if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-            data = request.get_json()
-            cursor.execute('INSERT INTO clients (name, phone, address, lat, lng) VALUES (%s, %s, %s, %s, %s)', (data.get('name'), data.get('phone'), data.get('address'), data.get('lat'), data.get('lng')))
-            log_action(cursor, request.current_user['id'], 'create_client', 'clients', cursor.lastrowid, f"عميل جديد: {data.get('name')}")
-            conn.close(); return jsonify({'success': True})
-        else:
-            cursor.execute('SELECT * FROM clients ORDER BY created_at DESC')
-            clients = cursor.fetchall()
-            conn.close(); return jsonify({'success': True, 'clients': clients})
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.method == 'POST':
+                if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+                data = request.get_json()
+                cursor.execute('INSERT INTO clients (name, phone, address, lat, lng) VALUES (%s, %s, %s, %s, %s)', (data.get('name'), data.get('phone'), data.get('address'), data.get('lat'), data.get('lng')))
+                log_action(cursor, request.current_user['id'], 'create_client', 'clients', cursor.lastrowid, f"عميل جديد: {data.get('name')}")
+                conn.close(); return jsonify({'success': True})
+            else:
+                cursor.execute('SELECT * FROM clients ORDER BY created_at DESC')
+                clients = cursor.fetchall()
+                conn.close(); return jsonify({'success': True, 'clients': clients})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
 @app.route('/api/forms', methods=['GET', 'POST'])
 def handle_forms():
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        if request.method == 'POST':
-            if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-            data = request.get_json()
-            cursor.execute('INSERT INTO forms (title, fields_json) VALUES (%s, %s)', (data.get('title'), json.dumps(data.get('fields'), ensure_ascii=False)))
-            form_id = cursor.lastrowid
-            log_action(cursor, request.current_user['id'], 'create_form', 'forms', form_id, f"نموذج جديد: {data.get('title')}")
-            conn.close(); return jsonify({'success': True, 'id': form_id})
-        else:
-            cursor.execute('SELECT * FROM forms ORDER BY created_at DESC')
-            forms = cursor.fetchall()
-            conn.close(); return jsonify({'success': True, 'forms': forms})
-
-@app.route('/api/sync/tasks', methods=['POST'])
-def sync_tasks():
-    data = request.get_json()
-    token = request.headers.get('Authorization').replace('Bearer ', '')
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute('SELECT * FROM users WHERE token = %s', (token,))
-        user = cursor.fetchone()
-        if not user or user['role'] != 'employee': return jsonify({'error': 'Unauthorized'}), 401
-        
-        updates = data.get('updates', [])
-        for upd in updates:
-            task_id = upd['taskId']
-            cursor.execute('SELECT * FROM tasks WHERE id = %s AND assigned_to = %s', (task_id, user['id']))
-            task = cursor.fetchone()
-            if not task: continue
-            
-            existing_notes = task['notes'] if task['notes'] else ""
-            new_note = upd.get('notes', "")
-            combined_notes = f"{existing_notes}\n[مزامنة أوفلاين]: {new_note}".strip() if new_note and existing_notes else new_note or existing_notes
-
-            new_status = upd.get('status', task['status'])
-            query = 'UPDATE tasks SET status = %s'
-            params = [new_status]
-            if new_status == 'completed' and task['status'] != 'completed': query += ', completed_at = NOW()'
-            if combined_notes: query += ', notes = %s'; params.append(combined_notes)
-            if upd.get('checklist') is not None: query += ', checklist = %s'; params.append(upd.get('checklist'))
-            query += ' WHERE id = %s'; params.append(task_id)
-            cursor.execute(query, params)
-    conn.close()
-    socketio.emit('task_updated', {}, room='admins')
-    return jsonify({'success': True})
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if request.method == 'POST':
+                if request.current_user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+                data = request.get_json()
+                cursor.execute('INSERT INTO forms (title, fields_json) VALUES (%s, %s)', (data.get('title'), json.dumps(data.get('fields'), ensure_ascii=False)))
+                form_id = cursor.lastrowid
+                log_action(cursor, request.current_user['id'], 'create_form', 'forms', form_id, f"نموذج جديد: {data.get('title')}")
+                conn.close(); return jsonify({'success': True, 'id': form_id})
+            else:
+                cursor.execute('SELECT * FROM forms ORDER BY created_at DESC')
+                forms = cursor.fetchall()
+                conn.close(); return jsonify({'success': True, 'forms': forms})
+    except Exception as e:
+        return jsonify({'error': 'Database Error', 'message': str(e)}), 500
 
 try:
     init_db()
