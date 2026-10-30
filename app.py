@@ -64,7 +64,7 @@ class DBPool:
     def get_conn(self):
         try:
             conn = self.pool.get(timeout=2)
-            conn.ping(reconnect=True) # التأكد من أن الاتصال ما زال حياً
+            conn.ping(reconnect=True)
             return conn
         except:
             return self._create_conn()
@@ -75,10 +75,8 @@ class DBPool:
         except queue.Full:
             conn.close()
 
-# تهيئة تجمع الاتصالات
 db_pool = DBPool(size=15)
 
-# غلاف للاتصال ليتوافق مع كود الإغلاق القديم دون الحاجة لتغييره
 class PooledConnWrapper:
     def __init__(self, conn):
         self.conn = conn
@@ -89,7 +87,6 @@ class PooledConnWrapper:
     def rollback(self):
         self.conn.rollback()
     def close(self):
-        # بدلاً من إغلاق الاتصال، نعيده إلى المسبح ليكون متاحاً للطلب التالي فوراً
         db_pool.release_conn(self.conn)
 
 def get_db_connection():
@@ -123,22 +120,29 @@ def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 🌟 التحديث الهيكلي الآلي (Auto-Migration) 🌟
-            # إضافة جميع الأعمدة الممكنة لجدول المهام لمنع أخطاء الـ Unknown column
+            # 🌟 التحديث الهيكلي الآلي الشامل لجميع الأعمدة الممكنة 🌟
             cols_to_add = [
+                "description TEXT",
+                "assigned_to INT",
+                "created_by INT",
+                "lat FLOAT",
+                "lng FLOAT",
+                "address TEXT",
                 "scheduled_start DATETIME",
                 "duration_hours FLOAT DEFAULT 2.0",
-                "description TEXT",
-                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
-                "completed_at DATETIME",
-                "address TEXT",
-                "client_id INT",
-                "work_order_id INT",
-                "form_id INT",
+                "due_date DATETIME",
+                "priority VARCHAR(50) DEFAULT 'normal'",
+                "status VARCHAR(50) DEFAULT 'new'",
+                "notes TEXT",
                 "image_url LONGTEXT",
                 "checklist TEXT",
                 "recurrence VARCHAR(50) DEFAULT 'none'",
-                "is_alerted TINYINT(1) DEFAULT 0"
+                "client_id INT",
+                "work_order_id INT",
+                "form_id INT",
+                "is_alerted TINYINT(1) DEFAULT 0",
+                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+                "completed_at DATETIME"
             ]
             for col in cols_to_add:
                 try: cursor.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
