@@ -5,6 +5,7 @@ import os
 import secrets
 import json
 import base64
+import queue
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask.json.provider import DefaultJSONProvider
@@ -35,22 +36,71 @@ DB_PASS = 'kaisi@0Ahmed'
 VAPID_PRIVATE_KEY = None
 VAPID_PUBLIC_KEY = None
 
+# ========================================================
+# 🚀 نظام تجميع الاتصالات (Connection Pooling) لسرعة صاروخية 🚀
+# ========================================================
+class DBPool:
+    def __init__(self, size=15):
+        self.pool = queue.Queue(maxsize=size)
+        self.size = size
+        for _ in range(size):
+            try:
+                self.pool.put(self._create_conn())
+            except Exception as e:
+                print(f"Pool Init Error: {e}")
+
+    def _create_conn(self):
+        return pymysql.connect(
+            host=DB_HOST, 
+            user=DB_USER, 
+            password=DB_PASS, 
+            database=DB_NAME,
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor, 
+            autocommit=True,
+            connect_timeout=10
+        )
+
+    def get_conn(self):
+        try:
+            conn = self.pool.get(timeout=2)
+            conn.ping(reconnect=True) # التأكد من أن الاتصال ما زال حياً
+            return conn
+        except:
+            return self._create_conn()
+
+    def release_conn(self, conn):
+        try:
+            self.pool.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+
+# تهيئة تجمع الاتصالات
+db_pool = DBPool(size=15)
+
+# غلاف للاتصال ليتوافق مع كود الإغلاق القديم دون الحاجة لتغييره
+class PooledConnWrapper:
+    def __init__(self, conn):
+        self.conn = conn
+    def cursor(self, *args, **kwargs):
+        return self.conn.cursor(*args, **kwargs)
+    def commit(self):
+        self.conn.commit()
+    def rollback(self):
+        self.conn.rollback()
+    def close(self):
+        # بدلاً من إغلاق الاتصال، نعيده إلى المسبح ليكون متاحاً للطلب التالي فوراً
+        db_pool.release_conn(self.conn)
+
 def get_db_connection():
-    conn = pymysql.connect(
-        host=DB_HOST, 
-        user=DB_USER, 
-        password=DB_PASS, 
-        database=DB_NAME,
-        charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor, 
-        autocommit=True,
-        connect_timeout=10
-    )
+    conn = db_pool.get_conn()
     try:
         with conn.cursor() as cursor: 
             cursor.execute("SET time_zone = '+03:00'")
     except: pass
-    return conn
+    return PooledConnWrapper(conn)
+
+# ========================================================
 
 def log_action(cursor, user_id, action, entity, entity_id, details=None):
     details_json = json.dumps(details, ensure_ascii=False) if details else None
@@ -73,36 +123,35 @@ def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 🌟 نظام التحديث الهيكلي الشامل الذكي (Auto-Migration) 🌟
-            # إضافة أي أعمدة قد تكون ناقصة في الجداول لمنع انهيار الـ Backend
+            # 🌟 التحديث الهيكلي الآلي (Auto-Migration) 🌟
+            # إضافة جميع الأعمدة الممكنة لجدول المهام لمنع أخطاء الـ Unknown column
+            cols_to_add = [
+                "scheduled_start DATETIME",
+                "duration_hours FLOAT DEFAULT 2.0",
+                "description TEXT",
+                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+                "completed_at DATETIME",
+                "address TEXT",
+                "client_id INT",
+                "work_order_id INT",
+                "form_id INT",
+                "image_url LONGTEXT",
+                "checklist TEXT",
+                "recurrence VARCHAR(50) DEFAULT 'none'",
+                "is_alerted TINYINT(1) DEFAULT 0"
+            ]
+            for col in cols_to_add:
+                try: cursor.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
+                except: pass
             
-            # جدول المهام (Tasks)
-            try: cursor.execute("ALTER TABLE tasks ADD COLUMN scheduled_start DATETIME")
-            except: pass
-            try: cursor.execute("ALTER TABLE tasks ADD COLUMN duration_hours FLOAT DEFAULT 2.0")
-            except: pass
-            try: cursor.execute("ALTER TABLE tasks ADD COLUMN description TEXT")
-            except: pass
-            try: cursor.execute("ALTER TABLE tasks ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
-            except: pass
-            try: cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at DATETIME")
-            except: pass
-            
-            # جدول المستخدمين (Users)
             try: cursor.execute("ALTER TABLE users ADD COLUMN status VARCHAR(50) DEFAULT 'active'")
             except: pass
             try: cursor.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
             except: pass
-            
-            # جدول العملاء (Clients)
             try: cursor.execute("ALTER TABLE clients ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
-
-            # جدول أوامر العمل (Work Orders)
             try: cursor.execute("ALTER TABLE work_orders ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
-            
-            # جدول الفرق (Teams)
             try: cursor.execute("ALTER TABLE teams ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
             
@@ -366,7 +415,6 @@ def get_all_tasks():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 🌟 تصحيح عمود الوصف وإرجاع الحقول بشكل آمن
             base_query = '''SELECT t.id, t.title, t.description, t.assigned_to, t.created_by, t.lat, t.lng, t.address, t.scheduled_start, t.duration_hours, t.due_date, t.priority, t.status, t.notes, t.image_url, t.checklist, t.recurrence, t.client_id, t.work_order_id, t.form_id, t.is_alerted, t.created_at, t.completed_at, u.name as assignee_name, u.team_id, c.name as client_name, c.phone as client_phone FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN clients c ON t.client_id = c.id'''
             if request.current_user['role'] == 'admin': cursor.execute(base_query + " ORDER BY t.id DESC")
             else: cursor.execute(base_query + " WHERE u.team_id IN (SELECT id FROM teams WHERE manager_id = %s) ORDER BY t.id DESC", (request.current_user['id'],))
@@ -456,7 +504,6 @@ def handle_teams():
                 log_action(cursor, request.current_user['id'], 'create_team', 'teams', team_id, f"إنشاء فريق: {data.get('name')}")
                 return jsonify({'success': True, 'id': team_id})
             else:
-                # 🌟 تصحيح جلب الفرق
                 cursor.execute('''SELECT t.id, t.name, t.manager_id, t.created_at, u.name as manager_name, (SELECT COUNT(*) FROM users WHERE team_id = t.id) as members_count FROM teams t LEFT JOIN users u ON t.manager_id = u.id ORDER BY t.id DESC''')
                 teams = cursor.fetchall()
                 return jsonify({'success': True, 'teams': teams})
@@ -479,7 +526,6 @@ def handle_work_orders():
                 log_action(cursor, request.current_user['id'], 'create_work_order', 'work_orders', wo_id, f"أمر عمل: {data.get('title')}")
                 return jsonify({'success': True, 'id': wo_id})
             else:
-                # 🌟 تصحيح جلب أوامر العمل
                 cursor.execute('''SELECT w.id, w.title, w.client_id, w.team_id, w.status, w.created_at, c.name as client_name, t.name as team_name, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id) as total_tasks, (SELECT COUNT(*) FROM tasks WHERE work_order_id = w.id AND status = 'completed') as completed_tasks FROM work_orders w LEFT JOIN clients c ON w.client_id = c.id LEFT JOIN teams t ON w.team_id = t.id ORDER BY w.id DESC''')
                 wos = cursor.fetchall()
                 return jsonify({'success': True, 'work_orders': wos})
